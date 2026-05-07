@@ -181,13 +181,43 @@ def _sheet_open():
     if gspread is None:
         return None
     url = os.getenv("GSHEET_URL", "").strip()
-    cred = os.getenv("GSERVICE_ACCOUNT_FILE", "").strip()
-    if not url or not cred:
+    if not url:
         return None
     try:
         sid = url.split("/d/", 1)[1].split("/", 1)[0] if "/d/" in url else url
-        gc = gspread.service_account(filename=cred)
-        return gc.open_by_key(sid)
+
+        # 1) Prefer credential file if present.
+        cred = os.getenv("GSERVICE_ACCOUNT_FILE", "").strip()
+        if cred:
+            cred_path = Path(cred)
+            if not cred_path.is_absolute():
+                cred_path = Path(__file__).resolve().parents[1] / cred_path
+            if cred_path.exists():
+                gc = gspread.service_account(filename=str(cred_path))
+                return gc.open_by_key(sid)
+
+        # 2) Fallback to base64 JSON in env (cloud friendly).
+        b64_json = os.getenv("GSERVICE_ACCOUNT_JSON_B64", "").strip()
+        if b64_json:
+            try:
+                info = json.loads(base64.b64decode(b64_json).decode("utf-8"))
+                gc = gspread.service_account_from_dict(info)
+                return gc.open_by_key(sid)
+            except Exception as inner_exc:
+                logging.warning(f"[Sheet] Invalid GSERVICE_ACCOUNT_JSON_B64: {inner_exc}")
+
+        # 3) Fallback to raw JSON in env.
+        raw_json = os.getenv("GSERVICE_ACCOUNT_JSON", "").strip()
+        if raw_json:
+            try:
+                info = json.loads(raw_json)
+                gc = gspread.service_account_from_dict(info)
+                return gc.open_by_key(sid)
+            except Exception as inner_exc:
+                logging.warning(f"[Sheet] Invalid GSERVICE_ACCOUNT_JSON: {inner_exc}")
+
+        logging.warning("[Sheet] No usable Google credential source found")
+        return None
     except Exception as exc:
         logging.warning(f"[Sheet] Cannot open spreadsheet: {exc}")
         return None
