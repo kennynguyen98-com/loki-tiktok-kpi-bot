@@ -277,6 +277,17 @@ def _find_col(header: List[str], *names: str) -> Optional[int]:
     return None
 
 
+def _find_schedule_header_row(values: List[List[str]]) -> Optional[int]:
+    """Locate the header row for LỊCH ĐĂNG even when the sheet uses '#' instead of 'CLIP #'"""
+    for i, row in enumerate(values, start=1):
+        norm = [(cell or "").strip().casefold() for cell in row]
+        has_date = "ngày đăng" in norm
+        has_clip_marker = "clip #" in norm or "#" in norm
+        if has_date and has_clip_marker:
+            return i
+    return None
+
+
 def _sheet_write_clip(
     clip_id: int,
     clip_day: date,
@@ -295,12 +306,7 @@ def _sheet_write_clip(
 
         values = ws.get_all_values()
         # Find header row
-        header_row_idx = None
-        for i, row in enumerate(values, start=1):
-            upper = " ".join((c or "").strip().upper() for c in row)
-            if "CLIP" in upper and "NGÀY" in upper:
-                header_row_idx = i
-                break
+        header_row_idx = _find_schedule_header_row(values)
         if header_row_idx is None:
             return False
 
@@ -380,12 +386,7 @@ def _sheet_update_stats(
             return False
 
         values = ws.get_all_values()
-        header_row_idx = None
-        for i, row in enumerate(values, start=1):
-            upper = " ".join((c or "").strip().upper() for c in row)
-            if "CLIP" in upper and "NGÀY" in upper:
-                header_row_idx = i
-                break
+        header_row_idx = _find_schedule_header_row(values)
         if header_row_idx is None:
             return False
 
