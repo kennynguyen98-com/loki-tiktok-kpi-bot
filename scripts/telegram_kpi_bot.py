@@ -74,7 +74,10 @@ def _setup_gservice_credentials(workspace_root: Path) -> None:
         return
     
     # Thử decode từ Base64 ENV var (dùng cho cloud deployment)
-    b64_json = os.getenv("GSERVICE_ACCOUNT_JSON_B64", "").strip()
+    b64_json = (
+        os.getenv("GSERVICE_ACCOUNT_JSON_B64", "").strip()
+        or os.getenv("GOOGLE_CREDENTIALS_B64", "").strip()
+    )
     if b64_json:
         try:
             json_str = base64.b64decode(b64_json).decode("utf-8")
@@ -85,7 +88,10 @@ def _setup_gservice_credentials(workspace_root: Path) -> None:
             logging.warning(f"[Setup] Không decode được GSERVICE_ACCOUNT_JSON_B64: {e}")
     
     # Thử direct JSON từ ENV var (backup)
-    json_direct = os.getenv("GSERVICE_ACCOUNT_JSON", "").strip()
+    json_direct = (
+        os.getenv("GSERVICE_ACCOUNT_JSON", "").strip()
+        or os.getenv("GOOGLE_CREDENTIALS", "").strip()
+    )
     if json_direct:
         try:
             creds_file.write_text(json_direct, encoding="utf-8")
@@ -195,9 +201,13 @@ def _sheet_open():
             if cred_path.exists():
                 gc = gspread.service_account(filename=str(cred_path))
                 return gc.open_by_key(sid)
+            logging.warning(f"[Sheet] Credential file not found: {cred_path}")
 
         # 2) Fallback to base64 JSON in env (cloud friendly).
-        b64_json = os.getenv("GSERVICE_ACCOUNT_JSON_B64", "").strip()
+        b64_json = (
+            os.getenv("GSERVICE_ACCOUNT_JSON_B64", "").strip()
+            or os.getenv("GOOGLE_CREDENTIALS_B64", "").strip()
+        )
         if b64_json:
             try:
                 info = json.loads(base64.b64decode(b64_json).decode("utf-8"))
@@ -207,7 +217,10 @@ def _sheet_open():
                 logging.warning(f"[Sheet] Invalid GSERVICE_ACCOUNT_JSON_B64: {inner_exc}")
 
         # 3) Fallback to raw JSON in env.
-        raw_json = os.getenv("GSERVICE_ACCOUNT_JSON", "").strip()
+        raw_json = (
+            os.getenv("GSERVICE_ACCOUNT_JSON", "").strip()
+            or os.getenv("GOOGLE_CREDENTIALS", "").strip()
+        )
         if raw_json:
             try:
                 info = json.loads(raw_json)
@@ -221,6 +234,24 @@ def _sheet_open():
     except Exception as exc:
         logging.warning(f"[Sheet] Cannot open spreadsheet: {exc}")
         return None
+
+
+def _log_sheet_health() -> None:
+    """Emit one startup log to verify Sheets connectivity in production."""
+    sh = _sheet_open()
+    if sh is None:
+        logging.warning("[Sheet] Startup check failed: cannot open spreadsheet")
+        return
+
+    try:
+        titles = [ws.title for ws in sh.worksheets()]
+        logging.info(f"[Sheet] Startup check OK: spreadsheet='{sh.title}', worksheets={len(titles)}")
+        if _ws_like(sh, "LỊCH ĐĂNG") is None:
+            logging.warning("[Sheet] Startup check: worksheet 'LỊCH ĐĂNG' not found")
+        else:
+            logging.info("[Sheet] Startup check: worksheet 'LỊCH ĐĂNG' found")
+    except Exception as exc:
+        logging.warning(f"[Sheet] Startup check error: {exc}")
 
 
 def _ws_like(sh, preferred: str):
@@ -1406,6 +1437,8 @@ def main() -> None:
         level=logging.INFO,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    _log_sheet_health()
 
     app = build_application(token=token, workspace_root=workspace_root)
 
