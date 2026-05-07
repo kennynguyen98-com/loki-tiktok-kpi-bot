@@ -1,0 +1,59 @@
+{
+  "project_name": "du-hoc-philippines-tiktok",
+  "default_platform": "tiktok",
+  "tiktok_account": "@kennyphilippines",
+  "default_topic": "du-hoc-philippines",
+  "posts_per_day": 1,
+  "slides_per_post": 7,
+  "post_time_slots": ["07:00", "20:30"],
+  "write_timestamped_outputs": true,
+  "writer_provider": "openai",
+  "openai_model": "gpt-4o-mini",
+  "school_data_file": "context/data/schools.csv",
+  "brand": {
+    "name": "Kenny Philippines",
+    "tone": "thuc-te, than-thien, ngan-gon, co-chieu-sau",
+    "services": ["du hoc Philippines", "hoc tieng Anh tai Philippines"],
+    "lead_channel_primary": "zalo",
+    "lead_channel_secondary": "tiktok-dm",
+    "cta_trigger_keyword": "Info",
+    "language": "vi"
+  },
+  "content_types": {
+    "thong-tin": {
+      "purpose": "tang follow, reach",
+      "ratio": 0.4
+    },
+    "cam-xuc-story": {
+      "purpose": "tang share, save",
+      "ratio": 0.35
+    },
+    "cta-truc-tiep": {
+      "purpose": "thu comment, lead",
+      "ratio": 0.25
+    }
+  },
+  "slide_structure": {
+    "slide_1": "Hook — cau hoi hoac so gay to mo",
+    "slide_2_5": "Noi dung chinh — moi slide 1 diem",
+    "slide_6": "Tomtat hoac insight thuc te",
+    "slide_7": "CTA — Comment 'Info' de nhan chi tiet"
+  },
+  "validation": {
+    "min_slides": 5,
+    "max_slides": 10,
+    "require_hook_in_slide_1": true,
+    "require_cta_in_last_slide": true,
+    "banned_phrases": [
+      "cam ket thanh cong",
+      "dam bao visa",
+      "100% duoc chap nhan",
+      "chac chan co viec lam",
+      "loi nhuan cao"
+    ]
+  },
+  "hashtags": {
+    "fixed": ["#duhocphilippines", "#hoctienganh", "#philippineslife", "#duhocsinh"],
+    "rotating_slots": 3
+  }
+}

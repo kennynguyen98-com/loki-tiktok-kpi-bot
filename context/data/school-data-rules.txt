@@ -1,0 +1,14 @@
+MUC DICH
+- File schools.csv la nguon du lieu truong de viet noi dung chinh xac hon.
+
+QUY TAC DIEN DU LIEU
+- hoc_phi_tu_usd_thang: chi dien gia tri 'tu' (vi du 300), khong dien gia tri tuyet doi.
+- thoi_luong_goi_tuan: vi du 4, 8, 12.
+- ky_tuc_xa_tu_usd_thang: dien gia tri toi thieu neu co.
+- uu_diem_noi_bat: toi da 1 cau ngan, uu tien thong tin kiem chung duoc.
+- phu_hop_voi: vi du 'nguoi mat goc', 'nguoi can IELTS gap', 'sinh vien'.
+- nguon_xac_thuc: link website truong hoac tai lieu tu truong.
+
+KHONG DUOC DIEN
+- thong tin cam ket visa, cam ket viec lam, cam ket dau ra.
+- so lieu hoc phi khong co nguon.

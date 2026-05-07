@@ -1,0 +1,24 @@
+{
+  "run_id": "20260421-162252-kiem-tra-safe-workflow-gip",
+  "status": "saved-local",
+  "keyword": "kiem tra safe workflow gip",
+  "platform": "wordpress",
+  "topic": "ecommerce-fulfillment",
+  "word_count": 1013,
+  "validation_score": 70,
+  "validation_ok": false,
+  "validation_issues": [
+    "Too short: 1013 < 1200",
+    "Missing section: Ket luan"
+  ],
+  "url": "https://gipfulfillment.com/kiem-tra-safe-workflow-gip-tai-sao-quan-trong-va-cach-thuc-hien",
+  "local_path": "D:\\Kenny\\HỌC AI AGENT\\content-agent-template\\posts\\kiem-tra-safe-workflow-gip-tai-sao-quan-trong-va-cach-thuc-hien.md",
+  "run_dir": "D:\\Kenny\\HỌC AI AGENT\\content-agent-template\\outputs\\20260421-162252-kiem-tra-safe-workflow-gip",
+  "social_channels": [
+    "facebook",
+    "linkedin",
+    "tiktok",
+    "youtube_shorts"
+  ],
+  "publish_mode": "draft-only-or-local"
+}
