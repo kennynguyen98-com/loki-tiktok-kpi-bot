@@ -20,6 +20,11 @@ from telegram.ext import (
 
 from google_sheet_sync import GoogleSheetSync, build_evening_kpi_text
 
+try:
+    import gspread
+except ImportError:
+    gspread = None
+
 
 TARGET_CLIPS = 20
 TARGET_VIEWS = 30000
@@ -27,6 +32,7 @@ ONE_CLIP_BIG = 10000
 ONE_CLIP_MID = 5000
 LOW_CLIP_MIN = 1000
 LOW_CLIP_MAX = 1500
+WEEKLY_TARGET = 5  # clip/week
 
 SAFE_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 DEFAULT_REMINDER_TIMES = "09:00,13:00,20:30"
@@ -102,6 +108,7 @@ def _empty_state() -> Dict[str, Any]:
         "authorized_chat_id": None,
         "next_clip_id": 1,
         "records": {},
+        "pending_2h_checks": {},  # clip_id -> {check_time, posted_at, title}
     }
 
 
@@ -118,6 +125,8 @@ def _load_state(path: Path) -> Dict[str, Any]:
         data["next_clip_id"] = 1
     if "authorized_chat_id" not in data:
         data["authorized_chat_id"] = None
+    if "pending_2h_checks" not in data:
+        data["pending_2h_checks"] = {}
     return data
 
 
@@ -162,6 +171,254 @@ def _stats_for_month(state: Dict[str, Any], month_key: str) -> MonthStats:
         clips_1k_to_1p5k=clips_1k_to_1p5k,
     )
 
+
+# ---------------------------------------------------------------------------
+# Google Sheet helpers
+# ---------------------------------------------------------------------------
+
+def _sheet_open():
+    """Open the configured Google Spreadsheet. Returns None if unavailable."""
+    if gspread is None:
+        return None
+    url = os.getenv("GSHEET_URL", "").strip()
+    cred = os.getenv("GSERVICE_ACCOUNT_FILE", "").strip()
+    if not url or not cred:
+        return None
+    try:
+        sid = url.split("/d/", 1)[1].split("/", 1)[0] if "/d/" in url else url
+        gc = gspread.service_account(filename=cred)
+        return gc.open_by_key(sid)
+    except Exception as exc:
+        logging.warning(f"[Sheet] Cannot open spreadsheet: {exc}")
+        return None
+
+
+def _ws_like(sh, preferred: str):
+    """Find worksheet by title with casefold fallback."""
+    try:
+        return sh.worksheet(preferred)
+    except Exception:
+        pass
+    wanted = preferred.strip().casefold()
+    for ws in sh.worksheets():
+        t = ws.title.strip().casefold()
+        if t == wanted or t.startswith(wanted):
+            return ws
+    return None
+
+
+def _find_col(header: List[str], *names: str) -> Optional[int]:
+    norm = [(v or "").strip().casefold() for v in header]
+    for name in names:
+        key = name.strip().casefold()
+        if key in norm:
+            return norm.index(key)
+    return None
+
+
+def _sheet_write_clip(
+    clip_id: int,
+    clip_day: date,
+    posted_at: datetime,
+    title: str = "",
+) -> bool:
+    """Write a new clip row (or update existing) in LỊCH ĐĂNG sheet."""
+    sh = _sheet_open()
+    if sh is None:
+        return False
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            logging.warning("[Sheet] LỊCH ĐĂNG not found")
+            return False
+
+        values = ws.get_all_values()
+        # Find header row
+        header_row_idx = None
+        for i, row in enumerate(values, start=1):
+            upper = " ".join((c or "").strip().upper() for c in row)
+            if "CLIP" in upper and "NGÀY" in upper:
+                header_row_idx = i
+                break
+        if header_row_idx is None:
+            return False
+
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_title = _find_col(header, "TIÊU ĐỀ", "CHỦ ĐỀ / TIÊU ĐỀ")
+        c_date = _find_col(header, "NGÀY ĐĂNG")
+        c_posted = _find_col(header, "Giờ đăng thực tế")
+        c_check2h = _find_col(header, "Giờ check +2h")
+        c_agent = _find_col(header, "Agent note")
+
+        # Find existing row for this clip number
+        target_row = None
+        for r_idx in range(header_row_idx + 1, len(values) + 1):
+            row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+            num_val = row[c_num] if c_num is not None and c_num < len(row) else ""
+            if (num_val or "").strip() == str(clip_id):
+                target_row = r_idx
+                break
+
+        if target_row is None:
+            # Find first empty slot
+            for r_idx in range(header_row_idx + 1, header_row_idx + 30):
+                row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+                num_val = row[c_num] if c_num is not None and c_num < len(row) else ""
+                if not (num_val or "").strip():
+                    target_row = r_idx
+                    break
+
+        if target_row is None:
+            return False
+
+        check_time = datetime(
+            posted_at.year, posted_at.month, posted_at.day,
+            posted_at.hour, posted_at.minute
+        )
+        from datetime import timedelta
+        check_2h = check_time + timedelta(hours=2)
+
+        updates = []
+        if c_num is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_num + 1), "values": [[str(clip_id)]]})
+        if c_title is not None and title:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_title + 1), "values": [[title]]})
+        if c_date is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_date + 1), "values": [[clip_day.strftime("%d/%m/%Y")]]})
+        if c_posted is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_posted + 1), "values": [[posted_at.strftime("%H:%M")]]})
+        if c_check2h is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_check2h + 1), "values": [[check_2h.strftime("%H:%M")]]})
+        if c_agent is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_agent + 1), "values": [["⏳ Chờ check 2h"]]})
+
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_write_clip error: {exc}")
+        return False
+
+
+def _sheet_update_stats(
+    clip_id: int,
+    views: int,
+    likes: int,
+    comments: int,
+    shares: int,
+    followers: int,
+) -> bool:
+    """Update 2h performance stats for a clip row in LỊCH ĐĂNG."""
+    sh = _sheet_open()
+    if sh is None:
+        return False
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            return False
+
+        values = ws.get_all_values()
+        header_row_idx = None
+        for i, row in enumerate(values, start=1):
+            upper = " ".join((c or "").strip().upper() for c in row)
+            if "CLIP" in upper and "NGÀY" in upper:
+                header_row_idx = i
+                break
+        if header_row_idx is None:
+            return False
+
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_view2h = _find_col(header, "View 2h")
+        c_like2h = _find_col(header, "Like 2h")
+        c_cmt2h = _find_col(header, "Comment 2h")
+        c_share2h = _find_col(header, "Share 2h")
+        c_flw2h = _find_col(header, "Follower tăng 2h")
+        c_checked = _find_col(header, "Đã check 2h?")
+        c_agent = _find_col(header, "Agent note")
+
+        target_row = None
+        for r_idx in range(header_row_idx + 1, len(values) + 1):
+            row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+            num_val = row[c_num] if c_num is not None and c_num < len(row) else ""
+            if (num_val or "").strip() == str(clip_id):
+                target_row = r_idx
+                break
+
+        if target_row is None:
+            return False
+
+        updates = []
+        for col, val in [
+            (c_view2h, views), (c_like2h, likes),
+            (c_cmt2h, comments), (c_share2h, shares),
+            (c_flw2h, followers),
+        ]:
+            if col is not None:
+                updates.append({"range": gspread.utils.rowcol_to_a1(target_row, col + 1), "values": [[val]]})
+        if c_checked is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_checked + 1), "values": [["✅ Đã check"]]})
+        if c_agent is not None:
+            eng = round((likes + comments + shares) / max(views, 1) * 100, 1)
+            note = f"Eng rate: {eng}%"
+            if views >= 10000:
+                note += " 🔥 Viral"
+            elif views >= 5000:
+                note += " ✅ Tốt"
+            elif views < 1000:
+                note += " ⚠️ Thấp"
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_agent + 1), "values": [[note]]})
+
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_update_stats error: {exc}")
+        return False
+
+
+def _week_clips_count(state: Dict[str, Any]) -> int:
+    """Count clips posted this calendar week (Mon-Sun)."""
+    today = date.today()
+    week_start = today - __import__('datetime').timedelta(days=today.weekday())
+    count = 0
+    for rows in state.get("records", {}).values():
+        for r in rows:
+            try:
+                d = date.fromisoformat(r.get("date", ""))
+                if d >= week_start:
+                    count += 1
+            except ValueError:
+                pass
+    return count
+
+
+def _kpi_warning_text(state: Dict[str, Any]) -> str:
+    """Return KPI warning text for this week's progress."""
+    today = date.today()
+    week_clips = _week_clips_count(state)
+    days_left_week = 6 - today.weekday()  # days until Sunday incl. today
+    missing = max(0, WEEKLY_TARGET - week_clips)
+
+    if missing == 0:
+        return f"✅ Tuần này đã đạt {week_clips}/{WEEKLY_TARGET} clip. Giữ đà!"
+
+    urgency = "🔴" if days_left_week <= 1 else ("🟠" if days_left_week <= 3 else "🟡")
+    lines = [
+        f"{urgency} KPI TUẦN NÀY",
+        f"Đã đăng: {week_clips}/{WEEKLY_TARGET} clip",
+        f"Còn thiếu: {missing} clip",
+        f"Còn {days_left_week} ngày trong tuần",
+    ]
+    if days_left_week > 0:
+        lines.append(f"Cần đăng ít nhất {math.ceil(missing / days_left_week)} clip/ngày để kịp")
+    else:
+        lines.append("⚠️ Hôm nay là Chủ nhật - tuần này không đạt mục tiêu!")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 
 def _progress_text(state: Dict[str, Any], target_day: Optional[date] = None) -> str:
     now = target_day or date.today()
@@ -307,7 +564,9 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "/weekly_review - Tóm tắt tuần vừa rồi\n"
         "/platform_snapshot - Trạng thái real-time\n"
         "/lead_report - Báo cáo lead từ comment\n"
-        "/content_ideas - Gợi ý chủ đề video AI"
+        "/content_ideas - Gợi ý chủ đề video AI\n\n"
+        "📊 STATS 2H:\n"
+        "/log_stats <id> <view> <like> <cmt> <share> <flw> - Nhập số liệu 2h sau đăng"
     )
     await update.message.reply_text(help_text)
 
@@ -324,6 +583,22 @@ async def cmd_status(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(_progress_text(state))
 
 
+async def _remind_2h_check(context: CallbackContext) -> None:
+    """Job fired 2 hours after /add_clip to ask for performance stats."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    clip_id = data["clip_id"]
+    title = data.get("title", f"clip #{clip_id}")
+    text = (
+        f"⏰ ĐÃ 2 TIẾNG SAU KHI ĐĂNG\n"
+        f"Clip #{clip_id} — {title}\n\n"
+        f"Nhập số liệu để bot cập nhật sheet và tính KPI:\n"
+        f"/log_stats {clip_id} <view> <like> <comment> <share> <follower_tang>\n\n"
+        f"Ví dụ: /log_stats {clip_id} 1200 85 12 3 5"
+    )
+    await context.bot.send_message(chat_id=int(chat_id), text=text)
+
+
 async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
     if update.effective_chat is None or context.bot_data.get("state_path") is None:
         return
@@ -334,8 +609,13 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(_reject_text())
         return
 
+    # Usage: /add_clip <views> [yyyy-mm-dd] [title...]
     if not context.args:
-        await update.message.reply_text("Dùng: /add_clip <views> [yyyy-mm-dd]")
+        await update.message.reply_text(
+            "Dùng: /add_clip <views> [yyyy-mm-dd] [tên clip]\n"
+            "Ví dụ: /add_clip 0 2026-05-07 Học AI\n"
+            "(views = 0 lúc mới đăng, điền số thật sau 2h khi bot nhắc)"
+        )
         return
 
     try:
@@ -347,12 +627,15 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
         return
 
     clip_day = date.today()
+    arg_offset = 1
     if len(context.args) >= 2:
         try:
             clip_day = _parse_date(context.args[1])
+            arg_offset = 2
         except ValueError:
-            await update.message.reply_text("Ngày không đúng định dạng. Dùng yyyy-mm-dd")
-            return
+            arg_offset = 1  # not a date, treat as title
+
+    title = " ".join(context.args[arg_offset:]).strip() if len(context.args) > arg_offset else ""
 
     mk = _month_key(clip_day)
     state.setdefault("records", {})
@@ -360,22 +643,125 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
 
     clip_id = int(state.get("next_clip_id", 1))
     state["next_clip_id"] = clip_id + 1
+    posted_at = datetime.now()
 
     state["records"][mk].append(
         {
             "id": clip_id,
             "date": clip_day.isoformat(),
             "views": views,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "title": title,
+            "created_at": posted_at.isoformat(timespec="seconds"),
         }
     )
+
+    # Store pending 2h check
+    from datetime import timedelta
+    check_time = posted_at + timedelta(hours=2)
+    state["pending_2h_checks"][str(clip_id)] = {
+        "check_time": check_time.isoformat(timespec="seconds"),
+        "posted_at": posted_at.isoformat(timespec="seconds"),
+        "title": title or f"clip #{clip_id}",
+    }
     _save_state(state_path, state)
 
-    msg = [
-        f"Đã thêm clip #{clip_id} ({clip_day.isoformat()}) với {views:,} view.",
+    # Write to Google Sheet
+    sheet_ok = _sheet_write_clip(clip_id, clip_day, posted_at, title)
+    sheet_note = " ✅ Đã ghi vào sheet." if sheet_ok else " (Sheet: chưa kết nối)"
+
+    # Schedule 2h reminder job
+    chat_id = update.effective_chat.id
+    context.application.job_queue.run_once(
+        _remind_2h_check,
+        when=timedelta(hours=2),
+        data={"chat_id": chat_id, "clip_id": clip_id, "title": title or f"clip #{clip_id}"},
+        name=f"2h_check_{clip_id}",
+    )
+
+    week_clips = _week_clips_count(state)
+    missing_week = max(0, WEEKLY_TARGET - week_clips)
+
+    msg_lines = [
+        f"✅ Đã thêm clip #{clip_id} ({clip_day.isoformat()}){sheet_note}",
+        f"⏰ Mình sẽ nhắc bạn nhập số liệu sau 2 tiếng.",
+        "",
         _progress_text(state, clip_day),
     ]
-    await update.message.reply_text("\n\n".join(msg))
+    if missing_week > 0:
+        msg_lines.append(f"\n📌 Tuần này còn thiếu {missing_week} clip để đạt {WEEKLY_TARGET}/tuần.")
+    else:
+        msg_lines.append(f"\n🎉 Tuần này đã đủ {WEEKLY_TARGET} clip!")
+
+    await update.message.reply_text("\n".join(msg_lines))
+
+
+async def cmd_log_stats(update: Update, context: CallbackContext) -> None:
+    """Nhận số liệu sau 2h: /log_stats <clip_id> <view> <like> <cmt> <share> <flw>"""
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+
+    state_path: Path = context.bot_data["state_path"]
+    state = _load_state(state_path)
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    usage = "Dùng: /log_stats <clip_id> <view> <like> <comment> <share> <follower_tăng>\nVí dụ: /log_stats 1 1200 85 12 3 5"
+    if not context.args or len(context.args) < 6:
+        await update.message.reply_text(usage)
+        return
+
+    try:
+        clip_id = int(context.args[0])
+        views = int(context.args[1])
+        likes = int(context.args[2])
+        comments = int(context.args[3])
+        shares = int(context.args[4])
+        followers = int(context.args[5])
+    except (ValueError, IndexError):
+        await update.message.reply_text(usage)
+        return
+
+    # Update views in local state
+    updated_local = False
+    for rows in state.get("records", {}).values():
+        for r in rows:
+            if int(r.get("id", -1)) == clip_id:
+                r["views"] = views
+                r["likes_2h"] = likes
+                r["comments_2h"] = comments
+                r["shares_2h"] = shares
+                r["followers_2h"] = followers
+                r["stats_updated_at"] = datetime.now().isoformat(timespec="seconds")
+                updated_local = True
+                break
+        if updated_local:
+            break
+
+    # Mark pending check as done
+    state["pending_2h_checks"].pop(str(clip_id), None)
+    _save_state(state_path, state)
+
+    # Update Google Sheet
+    sheet_ok = _sheet_update_stats(clip_id, views, likes, comments, shares, followers)
+
+    # Calculate engagement
+    eng = round((likes + comments + shares) / max(views, 1) * 100, 1)
+    perf = "🔥 Viral!" if views >= 10000 else ("✅ Tốt" if views >= 5000 else ("🟡 Trung bình" if views >= 1000 else "⚠️ Thấp"))
+
+    sheet_note = "\n✅ Đã cập nhật Google Sheet." if sheet_ok else "\n(Sheet chưa kết nối - dữ liệu lưu local)"
+
+    report = [
+        f"📊 STATS 2H — CLIP #{clip_id}",
+        f"👁 View: {views:,}   {perf}",
+        f"❤️ Like: {likes}   💬 Comment: {comments}",
+        f"↗️ Share: {shares}   👥 Follower tăng: {followers}",
+        f"📈 Engagement rate: {eng}%",
+        "",
+        _progress_text(state),
+        sheet_note,
+    ]
+    await update.message.reply_text("\n".join(report))
 
 
 async def cmd_set_views(update: Update, context: CallbackContext) -> None:
@@ -791,7 +1177,55 @@ async def cmd_content_ideas(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text("\n".join(ideas))
 
 
+async def morning_kpi_warning_job(context: CallbackContext) -> None:
+    """Gửi cảnh báo KPI mỗi sáng 8:30 — tiến độ tuần."""
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+    chat_id = state.get("authorized_chat_id")
+    if chat_id is None:
+        return
+    text = f"☀️ BÁO CÁO SÁNG\n\n{_kpi_warning_text(state)}\n\n{_progress_text(state)}"
+    await context.bot.send_message(chat_id=int(chat_id), text=text)
+
+
+async def friday_kpi_warning_job(context: CallbackContext) -> None:
+    """Gửi cảnh báo mỗi Thứ 6 17:00 nếu tuần chưa đủ clip."""
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+    chat_id = state.get("authorized_chat_id")
+    if chat_id is None:
+        return
+
+    # Only send if not yet meeting weekly target
+    week_clips = _week_clips_count(state)
+    if week_clips >= WEEKLY_TARGET:
+        return
+
+    missing = WEEKLY_TARGET - week_clips
+    text = (
+        f"🔔 NHẮC CUỐI TUẦN — THỨ 6 17H\n"
+        f"Tuần này: {week_clips}/{WEEKLY_TARGET} clip\n"
+        f"Còn thiếu {missing} clip — còn 2 ngày (T7 & CN) để bắt kịp!\n\n"
+        f"{_progress_text(state)}"
+    )
+    await context.bot.send_message(chat_id=int(chat_id), text=text)
+
+
 async def reminder_job(context: CallbackContext) -> None:
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+    chat_id = state.get("authorized_chat_id")
+    if chat_id is None:
+        return
+
+    text = _nudge_text(state)
+    await context.bot.send_message(chat_id=int(chat_id), text=text)
+
+
+async def morning_status_job(context: CallbackContext) -> None:
     app = context.application
     state_path: Path = app.bot_data["state_path"]
     state = _load_state(state_path)
@@ -886,6 +1320,20 @@ def _register_jobs(app: Application) -> None:
         time=datetime.strptime(f"{evening_hour:02d}:{evening_minute:02d}", "%H:%M").time(),
     )
 
+    # Morning KPI warning 8:30 every day
+    jq.run_daily(
+        morning_kpi_warning_job,
+        time=datetime.strptime("08:30", "%H:%M").time(),
+    )
+
+    # Friday 17:00 weekly warning
+    import datetime as _dt
+    jq.run_daily(
+        friday_kpi_warning_job,
+        time=_dt.time(17, 0),
+        days=(4,),  # 4 = Friday (APScheduler: 0=Mon)
+    )
+
 
 def build_application(token: str, workspace_root: Path) -> Application:
     app = Application.builder().token(token).build()
@@ -908,6 +1356,7 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("platform_snapshot", cmd_platform_snapshot))
     app.add_handler(CommandHandler("lead_report", cmd_lead_report))
     app.add_handler(CommandHandler("content_ideas", cmd_content_ideas))
+    app.add_handler(CommandHandler("log_stats", cmd_log_stats))
 
     _register_jobs(app)
     return app
