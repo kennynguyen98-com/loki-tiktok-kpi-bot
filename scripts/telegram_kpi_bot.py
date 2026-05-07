@@ -728,7 +728,7 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
 
     # Write to Google Sheet
     sheet_ok = _sheet_write_clip(clip_id, clip_day, posted_at, title)
-    sheet_note = " ✅ Đã ghi vào sheet." if sheet_ok else " (Sheet: chưa kết nối)"
+    sheet_note = " (Sheet: đã kết nối, đã ghi vào sheet)" if sheet_ok else " (Sheet: chưa kết nối)"
 
     # Schedule 2h reminder job
     chat_id = update.effective_chat.id
@@ -810,7 +810,7 @@ async def cmd_log_stats(update: Update, context: CallbackContext) -> None:
     eng = round((likes + comments + shares) / max(views, 1) * 100, 1)
     perf = "🔥 Viral!" if views >= 10000 else ("✅ Tốt" if views >= 5000 else ("🟡 Trung bình" if views >= 1000 else "⚠️ Thấp"))
 
-    sheet_note = "\n✅ Đã cập nhật Google Sheet." if sheet_ok else "\n(Sheet chưa kết nối - dữ liệu lưu local)"
+    sheet_note = "\n✅ Sheet: đã kết nối, đã cập nhật Google Sheet." if sheet_ok else "\n(Sheet chưa kết nối - dữ liệu lưu local)"
 
     report = [
         f"📊 STATS 2H — CLIP #{clip_id}",
