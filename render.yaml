@@ -1,0 +1,30 @@
+services:
+  - type: worker
+    name: loki-tiktok-kpi-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/telegram_kpi_bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GSHEET_URL
+        sync: false
+      - key: GSERVICE_ACCOUNT_JSON_B64
+        sync: false
+      - key: TG_REMINDER_TIMES
+        value: 09:00,13:00,20:30
+      - key: TG_MORNING_STATUS_HOUR
+        value: "8"
+      - key: TG_MORNING_STATUS_MINUTE
+        value: "30"
+      - key: TG_SHEET_SYNC_HOUR
+        value: "12"
+      - key: TG_SHEET_SYNC_MINUTE
+        value: "0"
+      - key: TG_EVENING_REPORT_HOUR
+        value: "17"
+      - key: TG_EVENING_REPORT_MINUTE
+        value: "0"
