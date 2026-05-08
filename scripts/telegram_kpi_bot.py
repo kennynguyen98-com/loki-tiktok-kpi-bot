@@ -1095,6 +1095,9 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "/lead_report - Báo cáo lead từ comment\n"
         "/content_ideas - Gợi ý chủ đề video AI\n"
         "/brief <chủ đề> - Generate + ghi CONTENT BRIEF\n\n"
+        "⚙️ PHASE 2:\n"
+        "/phase2_status - Kiểm tra trạng thái API TikTok\n"
+        "/phase2_scan_now - Chạy detect+refresh ngay\n\n"
         "📊 STATS 2H:\n"
         "/log_stats <id> <view> <like> <cmt> <share> <flw> - Nhập số liệu 2h sau đăng"
     )
@@ -1737,6 +1740,53 @@ async def cmd_brief(update: Update, context: CallbackContext) -> None:
     )
 
 
+def _phase2_status_text() -> str:
+    provider = TikTokMetricsProvider()
+    rapid = "✅" if provider.rapidapi_key else "❌"
+    tikapi = "✅" if provider.tikapi_key else "❌"
+    return (
+        "🧩 PHASE 2 STATUS\n"
+        f"- RAPIDAPI_KEY: {rapid}\n"
+        f"- TIKAPI_KEY: {tikapi}\n"
+        f"- Provider sẵn sàng: {'✅ Có' if provider.available() else '❌ Chưa'}\n"
+        "- Detect clip mới: mỗi 6h\n"
+        "- Refresh stats: mỗi 12h\n"
+        "- Test tay: /phase2_scan_now"
+    )
+
+
+async def cmd_phase2_status(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+    await update.message.reply_text(_phase2_status_text())
+
+
+async def cmd_phase2_scan_now(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    provider = TikTokMetricsProvider()
+    if not provider.available():
+        await update.message.reply_text(
+            "⚠️ Chưa có API key cho Phase 2.\n"
+            "Cần set RAPIDAPI_KEY hoặc TIKAPI_KEY trên Railway Variables.\n"
+            "Dùng /phase2_status để kiểm tra lại."
+        )
+        return
+
+    await detect_new_clip_job(context)
+    await refresh_tiktok_stats_job(context)
+    await update.message.reply_text("✅ Đã chạy scan Phase 2 thủ công (detect + refresh).")
+
+
 class TikTokMetricsProvider:
     """Placeholder provider for future RapidAPI/TikAPI integration."""
 
@@ -2029,6 +2079,8 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("content_ideas", cmd_content_ideas))
     app.add_handler(CommandHandler("log_stats", cmd_log_stats))
     app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("phase2_status", cmd_phase2_status))
+    app.add_handler(CommandHandler("phase2_scan_now", cmd_phase2_scan_now))
 
     _register_jobs(app)
     return app
