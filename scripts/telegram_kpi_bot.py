@@ -495,16 +495,28 @@ def _sheet_apply_kpi_month_formulas(sh, target_day: Optional[date] = None) -> bo
         date_start = f"DATE({start.year};{start.month};{start.day})"
         date_end = f"DATE({end.year};{end.month};{end.day})"
 
+        # Parse NGÀY ĐĂNG as dd/mm/yyyy text (legacy rows) and fallback to DATEVALUE.
+        date_expr = (
+            "IFERROR("
+            "DATE("
+            "VALUE(RIGHT('LỊCH ĐĂNG'!$H:$H;4));"
+            "VALUE(MID('LỊCH ĐĂNG'!$H:$H;4;2));"
+            "VALUE(LEFT('LỊCH ĐĂNG'!$H:$H;2))"
+            ");"
+            "IFERROR(DATEVALUE('LỊCH ĐĂNG'!$H:$H);0)"
+            ")"
+        )
+
         # KPI table rows in sheet: 16..19
         # Row 16: Số video đã đăng
         # Row 17: Video đạt >=10K view
         # Row 18: Video đạt >=5K view
         # Row 19: Tổng view
         formulas = [
-            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end})",
-            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end};'LỊCH ĐĂNG'!$K:$K;\">=10000\")",
-            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end};'LỊCH ĐĂNG'!$K:$K;\">=5000\")",
-            f"=SUMIFS('LỊCH ĐĂNG'!$K:$K;'LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end})",
+            f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>={date_start})*({date_expr}<{date_end}))",
+            f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>={date_start})*({date_expr}<{date_end})*(IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0)>=10000))",
+            f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>={date_start})*({date_expr}<{date_end})*(IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0)>=5000))",
+            f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>={date_start})*({date_expr}<{date_end})*IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0))",
         ]
 
         a1 = gspread.utils.rowcol_to_a1(16, month_col)
