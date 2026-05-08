@@ -36,6 +36,7 @@ WEEKLY_TARGET = 5  # clip/week
 
 SAFE_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 DEFAULT_REMINDER_TIMES = "09:00,13:00,20:30"
+DEFAULT_ENABLE_PAID_PHASE2 = "false"
 
 
 @dataclass
@@ -103,6 +104,12 @@ def _setup_gservice_credentials(workspace_root: Path) -> None:
 
 def _to_bool(value: str) -> bool:
     return str(value).strip().lower() in SAFE_TRUE_VALUES
+
+
+def _paid_phase2_enabled() -> bool:
+    """Paid TikTok API mode is opt-in only; keep free-first by default."""
+    raw = os.getenv("ENABLE_PAID_PHASE2", DEFAULT_ENABLE_PAID_PHASE2)
+    return _to_bool(raw)
 
 
 def _state_file(workspace_root: Path) -> Path:
@@ -1095,6 +1102,9 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "/lead_report - Báo cáo lead từ comment\n"
         "/content_ideas - Gợi ý chủ đề video AI\n"
         "/brief <chủ đề> - Generate + ghi CONTENT BRIEF\n\n"
+        "🆓 FREE MODE (không mất phí):\n"
+        "/free_status - Trạng thái mode miễn phí\n"
+        "/free_refresh - Refresh KPI + Dashboard ngay\n\n"
         "⚙️ PHASE 2:\n"
         "/phase2_status - Kiểm tra trạng thái API TikTok\n"
         "/phase2_scan_now - Chạy detect+refresh ngay\n\n"
@@ -1744,15 +1754,69 @@ def _phase2_status_text() -> str:
     provider = TikTokMetricsProvider()
     rapid = "✅" if provider.rapidapi_key else "❌"
     tikapi = "✅" if provider.tikapi_key else "❌"
+    paid_enabled = _paid_phase2_enabled()
+    paid_ready = paid_enabled and provider.available()
     return (
         "🧩 PHASE 2 STATUS\n"
+        f"- Free-first mode: {'✅ Bật' if not paid_enabled else '⚠️ Tắt'}\n"
+        f"- ENABLE_PAID_PHASE2: {'✅' if paid_enabled else '❌'}\n"
         f"- RAPIDAPI_KEY: {rapid}\n"
         f"- TIKAPI_KEY: {tikapi}\n"
-        f"- Provider sẵn sàng: {'✅ Có' if provider.available() else '❌ Chưa'}\n"
+        f"- Provider sẵn sàng: {'✅ Có' if paid_ready else '❌ Chưa'}\n"
         "- Detect clip mới: mỗi 6h\n"
         "- Refresh stats: mỗi 12h\n"
-        "- Test tay: /phase2_scan_now"
+        "- Test tay: /phase2_scan_now\n"
+        "- Miễn phí: /free_refresh"
     )
+
+
+def _run_free_refresh() -> tuple[bool, str]:
+    """Refresh sheet-derived KPI/dashboard without any paid API provider."""
+    sh = _sheet_open()
+    if sh is None:
+        return False, "Sheet chưa kết nối"
+
+    dash_ok = _sheet_refresh_dashboard_loki(sh)
+    kpi_ok = _sheet_apply_kpi_month_formulas(sh)
+
+    if dash_ok and kpi_ok:
+        return True, "Đã refresh Dashboard + KPI từ dữ liệu LỊCH ĐĂNG"
+    if dash_ok:
+        return True, "Đã refresh Dashboard (KPI chưa refresh được)"
+    if kpi_ok:
+        return True, "Đã refresh KPI (Dashboard chưa refresh được)"
+    return False, "Không refresh được Dashboard/KPI"
+
+
+async def cmd_free_status(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    paid_enabled = _paid_phase2_enabled()
+    await update.message.reply_text(
+        "🆓 FREE MODE STATUS\n"
+        f"- Chế độ miễn phí: {'✅ Đang bật' if not paid_enabled else '⚠️ Đang tắt'}\n"
+        "- Không dùng RapidAPI/TikAPI để tính KPI\n"
+        "- Nguồn KPI: /add_clip + /log_stats + LỊCH ĐĂNG\n"
+        "- Lệnh nên dùng: /free_refresh, /status, /weekly_review"
+    )
+
+
+async def cmd_free_refresh(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    ok, msg = _run_free_refresh()
+    icon = "✅" if ok else "⚠️"
+    await update.message.reply_text(f"{icon} {msg}")
 
 
 async def cmd_phase2_status(update: Update, context: CallbackContext) -> None:
@@ -1774,11 +1838,14 @@ async def cmd_phase2_scan_now(update: Update, context: CallbackContext) -> None:
         return
 
     provider = TikTokMetricsProvider()
-    if not provider.available():
+    if not _paid_phase2_enabled() or not provider.available():
+        ok, msg = _run_free_refresh()
         await update.message.reply_text(
-            "⚠️ Chưa có API key cho Phase 2.\n"
-            "Cần set RAPIDAPI_KEY hoặc TIKAPI_KEY trên Railway Variables.\n"
-            "Dùng /phase2_status để kiểm tra lại."
+            (
+                f"{'✅' if ok else '⚠️'} Đang chạy FREE MODE: {msg}\n"
+                "Để bật phase 2 trả phí: set ENABLE_PAID_PHASE2=true và thêm RAPIDAPI_KEY/TIKAPI_KEY.\n"
+                "Dùng /phase2_status để kiểm tra lại."
+            )
         )
         return
 
@@ -1857,6 +1924,9 @@ async def saturday_weekly_report_job(context: CallbackContext) -> None:
 
 async def detect_new_clip_job(context: CallbackContext) -> None:
     """Every 6h: detect new clip from TikTok provider (placeholder until API key)."""
+    if not _paid_phase2_enabled():
+        logging.info("[TikTok] detect_new_clip_job skipped: free-first mode is ON")
+        return
     provider = TikTokMetricsProvider()
     if not provider.available():
         logging.info("[TikTok] detect_new_clip_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
@@ -1865,6 +1935,9 @@ async def detect_new_clip_job(context: CallbackContext) -> None:
 
 async def refresh_tiktok_stats_job(context: CallbackContext) -> None:
     """Every 12h: refresh stats for known clip links (placeholder until API key)."""
+    if not _paid_phase2_enabled():
+        logging.info("[TikTok] refresh_tiktok_stats_job skipped: free-first mode is ON")
+        return
     provider = TikTokMetricsProvider()
     if not provider.available():
         logging.info("[TikTok] refresh_tiktok_stats_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
@@ -2079,6 +2152,8 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("content_ideas", cmd_content_ideas))
     app.add_handler(CommandHandler("log_stats", cmd_log_stats))
     app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("free_status", cmd_free_status))
+    app.add_handler(CommandHandler("free_refresh", cmd_free_refresh))
     app.add_handler(CommandHandler("phase2_status", cmd_phase2_status))
     app.add_handler(CommandHandler("phase2_scan_now", cmd_phase2_scan_now))
 
