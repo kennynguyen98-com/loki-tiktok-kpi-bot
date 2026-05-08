@@ -7,7 +7,7 @@ import os
 import asyncio
 import base64
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -362,6 +362,8 @@ def _sheet_write_clip(
 
         if updates:
             ws.batch_update(updates, value_input_option="RAW")
+
+        _sheet_refresh_dashboard_loki(sh)
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_write_clip error: {exc}")
@@ -434,9 +436,459 @@ def _sheet_update_stats(
 
         if updates:
             ws.batch_update(updates, value_input_option="RAW")
+
+        # Keep DASHBOARD KÊNH in sync with LỊCH ĐĂNG after every stats update.
+        _sheet_refresh_dashboard_loki(sh)
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_update_stats error: {exc}")
+        return False
+
+
+def _parse_sheet_date(text: str) -> Optional[date]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _to_int_safe(raw: str) -> int:
+    s = str(raw or "").replace(",", "").strip()
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _month_window(target_day: date) -> tuple[date, date]:
+    start = date(target_day.year, target_day.month, 1)
+    if target_day.month == 12:
+        end = date(target_day.year + 1, 1, 1)
+    else:
+        end = date(target_day.year, target_day.month + 1, 1)
+    return start, end
+
+
+def _sheet_apply_kpi_month_formulas(sh, target_day: Optional[date] = None) -> bool:
+    """Fill KPI monthly formulas for current month based on LỊCH ĐĂNG."""
+    try:
+        ws = _ws_like(sh, "KPI")
+        if ws is None:
+            return False
+
+        d = target_day or date.today()
+        month_col = 2 + d.month  # B=2 is KPI name, C=3 is unit, T4 starts at D=4
+        if month_col < 4 or month_col > 12:
+            return False
+
+        start, end = _month_window(d)
+        date_start = f"DATE({start.year};{start.month};{start.day})"
+        date_end = f"DATE({end.year};{end.month};{end.day})"
+
+        # KPI table rows in sheet: 16..19
+        # Row 16: Số video đã đăng
+        # Row 17: Video đạt >=10K view
+        # Row 18: Video đạt >=5K view
+        # Row 19: Tổng view
+        formulas = [
+            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end})",
+            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end};'LỊCH ĐĂNG'!$K:$K;\">=10000\")",
+            f"=COUNTIFS('LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end};'LỊCH ĐĂNG'!$K:$K;\">=5000\")",
+            f"=SUMIFS('LỊCH ĐĂNG'!$K:$K;'LỊCH ĐĂNG'!$B:$B;\"<>\";'LỊCH ĐĂNG'!$H:$H;\">=\"&{date_start};'LỊCH ĐĂNG'!$H:$H;\"<\"&{date_end})",
+        ]
+
+        a1 = gspread.utils.rowcol_to_a1(16, month_col)
+        ws.update(range_name=f"{a1}:{gspread.utils.rowcol_to_a1(19, month_col)}", values=[[f] for f in formulas], value_input_option="USER_ENTERED")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_apply_kpi_month_formulas error: {exc}")
+        return False
+
+
+def _week_window_monday_sunday(ref: date) -> tuple[date, date]:
+    start = ref - timedelta(days=ref.weekday())
+    end = start + timedelta(days=6)
+    return start, end
+
+
+def _collect_schedule_rows(sh) -> tuple[list[list[str]], list[str], int] | tuple[None, None, None]:
+    ws = _ws_like(sh, "LỊCH ĐĂNG")
+    if ws is None:
+        return None, None, None
+    values = ws.get_all_values()
+    header_row_idx = _find_schedule_header_row(values)
+    if header_row_idx is None:
+        return None, None, None
+    header = values[header_row_idx - 1]
+    rows = values[header_row_idx:]
+    return rows, header, header_row_idx
+
+
+def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
+    """Fill BÁO CÁO TUẦN from LỊCH ĐĂNG data."""
+    try:
+        ws = _ws_like(sh, "BÁO CÁO TUẦN")
+        if ws is None:
+            return False
+
+        rows, header, _ = _collect_schedule_rows(sh)
+        if rows is None or header is None:
+            return False
+
+        c_num = _find_col(header, "CLIP #", "#")
+        c_title = _find_col(header, "CHỦ ĐỀ / TIÊU ĐỀ", "TIÊU ĐỀ")
+        c_link = _find_col(header, "LINK TikTok VN")
+        c_date = _find_col(header, "NGÀY ĐĂNG")
+        c_views = _find_col(header, "View 2h")
+        c_likes = _find_col(header, "Like 2h")
+        c_comments = _find_col(header, "Comment 2h")
+        c_shares = _find_col(header, "Share 2h")
+
+        if None in (c_num, c_date, c_views):
+            return False
+
+        week_rows = []
+        for row in rows:
+            num_val = row[c_num].strip() if c_num < len(row) else ""
+            if not num_val:
+                continue
+            d = _parse_sheet_date(row[c_date] if c_date < len(row) else "")
+            if d is None or d < week_start or d > week_end:
+                continue
+            week_rows.append(row)
+
+        clips = len(week_rows)
+        total_views = sum(_to_int_safe(row[c_views] if c_views < len(row) else "") for row in week_rows)
+        ge10k = sum(1 for row in week_rows if _to_int_safe(row[c_views] if c_views < len(row) else "") >= 10000)
+        ge5k = sum(1 for row in week_rows if _to_int_safe(row[c_views] if c_views < len(row) else "") >= 5000)
+
+        # Header info row
+        week_no = week_start.isocalendar().week
+        updates = [
+            {"range": "C4", "values": [[str(week_no)]]},
+            {"range": "E4", "values": [[week_start.strftime("%d/%m/%Y")]]},
+            {"range": "G4", "values": [[week_end.strftime("%d/%m/%Y")]]},
+        ]
+
+        # KPI section rows 8..12
+        target = {
+            8: 5,
+            9: 7500,
+            10: 1,
+            11: 1,
+            12: 3,  # script hoàn thành (placeholder)
+        }
+        actual = {
+            8: clips,
+            9: total_views,
+            10: ge10k,
+            11: ge5k,
+            12: max(0, clips),
+        }
+
+        for r in [8, 9, 10, 11, 12]:
+            a = actual[r]
+            t = target[r]
+            diff = a - t
+            ok = "✅" if a >= t else "⚠️"
+            updates.append({"range": f"D{r}", "values": [[a]]})
+            updates.append({"range": f"E{r}", "values": [[ok]]})
+            updates.append({"range": f"F{r}", "values": [[diff]]})
+
+        # Top 3 rows 16..18
+        top = sorted(week_rows, key=lambda row: _to_int_safe(row[c_views] if c_views < len(row) else ""), reverse=True)[:3]
+        for idx in range(3):
+            r = 16 + idx
+            if idx < len(top):
+                row = top[idx]
+                title = row[c_title] if (c_title is not None and c_title < len(row)) else ""
+                views = _to_int_safe(row[c_views] if c_views < len(row) else "")
+                likes = _to_int_safe(row[c_likes] if c_likes is not None and c_likes < len(row) else "")
+                cmt = _to_int_safe(row[c_comments] if c_comments is not None and c_comments < len(row) else "")
+                link = row[c_link] if (c_link is not None and c_link < len(row)) else ""
+                updates.extend([
+                    {"range": f"B{r}", "values": [[title]]},
+                    {"range": f"C{r}", "values": [["TikTok VN"]]},
+                    {"range": f"D{r}", "values": [[views]]},
+                    {"range": f"E{r}", "values": [[likes]]},
+                    {"range": f"F{r}", "values": [[cmt]]},
+                    {"range": f"G{r}", "values": [[link]]},
+                ])
+            else:
+                updates.extend([
+                    {"range": f"B{r}:G{r}", "values": [["", "", "", "", "", ""]]},
+                ])
+
+        # Section C quick diagnosis row 22
+        if clips < 5:
+            issue, cause, action = "Thiếu số clip", "Tần suất đăng chưa đủ", "Ưu tiên 1-2 clip/ngày trong 3 ngày tới"
+        elif total_views < 7500:
+            issue, cause, action = "View thấp", "Hook/thumbnail chưa đủ mạnh", "A/B test hook 2s đầu + caption CTA rõ hơn"
+        else:
+            issue, cause, action = "On track", "KPI tuần đạt", "Giữ nhịp đều và tập trung clip có khả năng >=5K"
+        updates.extend([
+            {"range": "B22", "values": [[issue]]},
+            {"range": "C22", "values": [[cause]]},
+            {"range": "D22:G22", "values": [[action, "", "", ""]]},
+        ])
+
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_fill_weekly_report error: {exc}")
+        return False
+
+
+def _brief_generate(topic: str) -> Dict[str, str]:
+    t = topic.strip()
+    if not t:
+        t = "Fulfillment Philippines"
+    title = f"{t[:38]}".strip()
+    thumb = f"{t[:18].upper()} | THỰC CHIẾN"
+    caption = (
+        f"{t}: seller mới thường vướng chỗ nào? Mình gom case thật + cách xử lý nhanh trong 60s. "
+        f"Comment 'CHECKLIST' để mình gửi form vận hành mẫu."
+    )
+    desc = (
+        f"Góc nhìn thực chiến về {t}.\n"
+        f"#fulfillment #tiktokshop #shopee #philippines #sellerviet #gip"
+    )
+    return {
+        "title": title,
+        "thumbnail": thumb,
+        "caption": caption,
+        "desc": desc,
+        "note": "Generated by /brief",
+    }
+
+
+def _sheet_add_brief(topic: str) -> tuple[bool, str]:
+    sh = _sheet_open()
+    if sh is None:
+        return False, "Sheet chưa kết nối"
+    try:
+        ws = _ws_like(sh, "CONTENT BRIEF")
+        if ws is None:
+            return False, "Không thấy sheet CONTENT BRIEF"
+
+        vals = ws.get_all_values()
+        header_row = None
+        for i, row in enumerate(vals, start=1):
+            norm = " ".join((x or "").strip().casefold() for x in row)
+            if "chủ đề" in norm and "trạng thái" in norm:
+                header_row = i
+                break
+        if header_row is None:
+            return False, "Không tìm thấy header CONTENT BRIEF"
+
+        header = vals[header_row - 1]
+        c_num = _find_col(header, "#")
+        c_title = _find_col(header, "CHỦ ĐỀ / TIÊU ĐỀ")
+        c_thumb = _find_col(header, "THUMBNAIL TITLE")
+        c_caption = _find_col(header, "CAPTION")
+        c_desc = _find_col(header, "MÔ TẢ + HASHTAG")
+        c_note = _find_col(header, "GHI CHÚ")
+        c_status = _find_col(header, "TRẠNG THÁI")
+
+        next_row = None
+        next_id = 1
+        for r in range(header_row + 1, header_row + 40):
+            row = vals[r - 1] if r - 1 < len(vals) else []
+            num = row[c_num].strip() if c_num is not None and c_num < len(row) else ""
+            if num:
+                next_id = max(next_id, _to_int_safe(num) + 1)
+            elif next_row is None:
+                next_row = r
+        if next_row is None:
+            next_row = header_row + 1
+
+        b = _brief_generate(topic)
+        updates = []
+        if c_num is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_num + 1), "values": [[next_id]]})
+        if c_title is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_title + 1), "values": [[b["title"]]]})
+        if c_thumb is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_thumb + 1), "values": [[b["thumbnail"]]]})
+        if c_caption is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_caption + 1), "values": [[b["caption"]]]})
+        if c_desc is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_desc + 1), "values": [[b["desc"]]]})
+        if c_note is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_note + 1), "values": [[b["note"]]]})
+        if c_status is not None:
+            updates.append({"range": gspread.utils.rowcol_to_a1(next_row, c_status + 1), "values": [["🟡 Chờ duyệt"]]})
+
+        if updates:
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+        return True, f"Đã thêm brief vào row {next_row}"
+    except Exception as exc:
+        return False, f"Lỗi ghi CONTENT BRIEF: {exc}"
+
+
+def _sheet_refresh_dashboard_loki(sh) -> bool:
+    """Update DASHBOARD KÊNH / TikTok Loki Trần block from LỊCH ĐĂNG data."""
+    try:
+        ws_schedule = _ws_like(sh, "LỊCH ĐĂNG")
+        ws_dash = _ws_like(sh, "DASHBOARD KÊNH")
+        if ws_schedule is None or ws_dash is None:
+            return False
+
+        values = ws_schedule.get_all_values()
+        header_row_idx = _find_schedule_header_row(values)
+        if header_row_idx is None:
+            return False
+
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_date = _find_col(header, "NGÀY ĐĂNG")
+        c_view2h = _find_col(header, "View 2h")
+        c_like2h = _find_col(header, "Like 2h")
+        c_cmt2h = _find_col(header, "Comment 2h")
+        c_flw2h = _find_col(header, "Follower tăng 2h")
+
+        if None in (c_num, c_date, c_view2h, c_like2h, c_cmt2h, c_flw2h):
+            return False
+
+        today = date.today()
+        week_start = today - __import__("datetime").timedelta(days=today.weekday())
+        month_start = date(today.year, today.month, 1)
+        quarter_month = ((today.month - 1) // 3) * 3 + 1
+        quarter_start = date(today.year, quarter_month, 1)
+        year_start = date(today.year, 1, 1)
+
+        buckets = {
+            "today": {"views": 0, "likes": 0, "comments": 0, "followers": 0, "clips": 0},
+            "week": {"views": 0, "likes": 0, "comments": 0, "followers": 0, "clips": 0},
+            "month": {"views": 0, "likes": 0, "comments": 0, "followers": 0, "clips": 0},
+            "quarter": {"views": 0, "likes": 0, "comments": 0, "followers": 0, "clips": 0},
+            "year": {"views": 0, "likes": 0, "comments": 0, "followers": 0, "clips": 0},
+        }
+
+        for r_idx in range(header_row_idx + 1, len(values) + 1):
+            row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+            num_val = row[c_num] if c_num < len(row) else ""
+            if not (num_val or "").strip():
+                continue
+
+            d = _parse_sheet_date(row[c_date] if c_date < len(row) else "")
+            if d is None:
+                continue
+
+            def _to_int(idx: int) -> int:
+                if idx >= len(row):
+                    return 0
+                raw = str(row[idx]).replace(",", "").strip()
+                if not raw:
+                    return 0
+                try:
+                    return int(float(raw))
+                except ValueError:
+                    return 0
+
+            v = _to_int(c_view2h)
+            l = _to_int(c_like2h)
+            c = _to_int(c_cmt2h)
+            f = _to_int(c_flw2h)
+
+            if d == today:
+                b = buckets["today"]
+                b["views"] += v
+                b["likes"] += l
+                b["comments"] += c
+                b["followers"] += f
+                b["clips"] += 1
+            if d >= week_start:
+                b = buckets["week"]
+                b["views"] += v
+                b["likes"] += l
+                b["comments"] += c
+                b["followers"] += f
+                b["clips"] += 1
+            if d >= month_start:
+                b = buckets["month"]
+                b["views"] += v
+                b["likes"] += l
+                b["comments"] += c
+                b["followers"] += f
+                b["clips"] += 1
+            if d >= quarter_start:
+                b = buckets["quarter"]
+                b["views"] += v
+                b["likes"] += l
+                b["comments"] += c
+                b["followers"] += f
+                b["clips"] += 1
+            if d >= year_start:
+                b = buckets["year"]
+                b["views"] += v
+                b["likes"] += l
+                b["comments"] += c
+                b["followers"] += f
+                b["clips"] += 1
+
+        dash_vals = ws_dash.get_all_values()
+        loki_title_row = None
+        for i, row in enumerate(dash_vals, start=1):
+            text = " ".join((x or "").strip() for x in row).casefold()
+            if "tiktok loki" in text:
+                loki_title_row = i
+                break
+        if loki_title_row is None:
+            return False
+
+        metric_rows = {}
+        for i in range(loki_title_row + 1, min(loki_title_row + 12, len(dash_vals) + 1)):
+            row = dash_vals[i - 1]
+            metric = (row[1] if len(row) > 1 else "").strip().casefold()
+            if metric:
+                metric_rows[metric] = i
+
+        periods = ["today", "week", "month", "quarter", "year"]
+
+        def series(metric_key: str) -> List[int]:
+            return [buckets[p][metric_key] for p in periods]
+
+        def series_avg() -> List[float]:
+            out = []
+            for p in periods:
+                clips = buckets[p]["clips"]
+                out.append(round(buckets[p]["views"] / clips, 1) if clips else 0)
+            return out
+
+        updates = []
+        row_views = metric_rows.get("views")
+        row_likes = metric_rows.get("likes")
+        row_comments = metric_rows.get("comments")
+        row_followers = metric_rows.get("followers")
+        row_clips = metric_rows.get("clip đăng")
+        row_avg = metric_rows.get("views/clip tb")
+
+        for row_idx, vals in [
+            (row_views, series("views")),
+            (row_likes, series("likes")),
+            (row_comments, series("comments")),
+            (row_followers, series("followers")),
+            (row_clips, series("clips")),
+            (row_avg, series_avg()),
+        ]:
+            if row_idx is None:
+                continue
+            # C:G = HÔM NAY..NĂM NAY
+            updates.append({"range": f"C{row_idx}:G{row_idx}", "values": [vals]})
+
+        if updates:
+            ws_dash.batch_update(updates, value_input_option="RAW")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_refresh_dashboard_loki error: {exc}")
         return False
 
 
@@ -626,7 +1078,8 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "/weekly_review - Tóm tắt tuần vừa rồi\n"
         "/platform_snapshot - Trạng thái real-time\n"
         "/lead_report - Báo cáo lead từ comment\n"
-        "/content_ideas - Gợi ý chủ đề video AI\n\n"
+        "/content_ideas - Gợi ý chủ đề video AI\n"
+        "/brief <chủ đề> - Generate + ghi CONTENT BRIEF\n\n"
         "📊 STATS 2H:\n"
         "/log_stats <id> <view> <like> <cmt> <share> <flw> - Nhập số liệu 2h sau đăng"
     )
@@ -654,8 +1107,7 @@ async def _remind_2h_check(context: CallbackContext) -> None:
     text = (
         f"⏰ ĐÃ 2 TIẾNG SAU KHI ĐĂNG\n"
         f"Clip #{clip_id} — {title}\n\n"
-        f"Nhập số liệu để bot cập nhật sheet và tính KPI:\n"
-        f"/log_stats {clip_id} <view> <like> <comment> <share> <follower_tang>\n\n"
+        f"Nhập số liệu để bot cập nhật sheet và tính KPI (không nhập dấu < >):\n"
         f"Ví dụ: /log_stats {clip_id} 1200 85 12 3 5"
     )
     await context.bot.send_message(chat_id=int(chat_id), text=text)
@@ -768,7 +1220,7 @@ async def cmd_log_stats(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(_reject_text())
         return
 
-    usage = "Dùng: /log_stats <clip_id> <view> <like> <comment> <share> <follower_tăng>\nVí dụ: /log_stats 1 1200 85 12 3 5"
+    usage = "Dùng (không nhập dấu < >): /log_stats 1 1200 85 12 3 5"
     if not context.args or len(context.args) < 6:
         await update.message.reply_text(usage)
         return
@@ -1239,6 +1691,121 @@ async def cmd_content_ideas(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text("\n".join(ideas))
 
 
+async def cmd_brief(update: Update, context: CallbackContext) -> None:
+    """Generate and store a CONTENT BRIEF row from a topic."""
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    topic = " ".join(context.args).strip()
+    if not topic:
+        await update.message.reply_text("Dùng: /brief <chủ đề>\nVí dụ: /brief COD Philippines cho seller mới")
+        return
+
+    ok, msg = _sheet_add_brief(topic)
+    if not ok:
+        await update.message.reply_text(f"❌ {msg}")
+        return
+
+    b = _brief_generate(topic)
+    await update.message.reply_text(
+        "✅ Đã generate brief vào CONTENT BRIEF\n"
+        f"- Chủ đề: {b['title']}\n"
+        f"- Thumbnail: {b['thumbnail']}\n"
+        f"- Caption: {b['caption']}\n"
+        f"- Mô tả+hashtag: {b['desc']}\n"
+        f"{msg}"
+    )
+
+
+class TikTokMetricsProvider:
+    """Placeholder provider for future RapidAPI/TikAPI integration."""
+
+    def __init__(self) -> None:
+        self.rapidapi_key = os.getenv("RAPIDAPI_KEY", "").strip()
+        self.tikapi_key = os.getenv("TIKAPI_KEY", "").strip()
+
+    def available(self) -> bool:
+        return bool(self.rapidapi_key or self.tikapi_key)
+
+    def detect_recent_posts(self, handle: str, hours_back: int = 6) -> List[Dict[str, Any]]:
+        # Placeholder: return [] until API adapter is connected.
+        _ = (handle, hours_back)
+        return []
+
+    def fetch_post_metrics(self, post_url: str) -> Optional[Dict[str, int]]:
+        # Placeholder: return None until API adapter is connected.
+        _ = post_url
+        return None
+
+
+async def kpi_formula_refresh_job(context: CallbackContext) -> None:
+    """Refresh KPI monthly formulas from LỊCH ĐĂNG."""
+    sh = _sheet_open()
+    if sh is None:
+        return
+    _sheet_apply_kpi_month_formulas(sh)
+
+
+def _last_completed_week() -> tuple[date, date]:
+    today = date.today()
+    current_week_start = today - timedelta(days=today.weekday())
+    last_week_end = current_week_start - timedelta(days=1)
+    last_week_start = last_week_end - timedelta(days=6)
+    return last_week_start, last_week_end
+
+
+async def saturday_weekly_report_job(context: CallbackContext) -> None:
+    """Generate BÁO CÁO TUẦN and push summary to Telegram at Saturday 08:00."""
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+    chat_id = state.get("authorized_chat_id")
+    if chat_id is None:
+        return
+
+    sh = _sheet_open()
+    if sh is None:
+        await context.bot.send_message(chat_id=int(chat_id), text="⚠️ Không mở được sheet để tổng hợp BÁO CÁO TUẦN.")
+        return
+
+    ws, we = _last_completed_week()
+    ok = _sheet_fill_weekly_report(sh, ws, we)
+    if not ok:
+        await context.bot.send_message(chat_id=int(chat_id), text="⚠️ Không ghi được BÁO CÁO TUẦN từ LỊCH ĐĂNG.")
+        return
+
+    await context.bot.send_message(
+        chat_id=int(chat_id),
+        text=(
+            f"📮 BÁO CÁO TUẦN đã cập nhật\n"
+            f"- Tuần: {ws.strftime('%d/%m/%Y')} → {we.strftime('%d/%m/%Y')}\n"
+            f"- Sheet: BÁO CÁO TUẦN\n"
+            f"- Nguồn: LỊCH ĐĂNG"
+        ),
+    )
+
+
+async def detect_new_clip_job(context: CallbackContext) -> None:
+    """Every 6h: detect new clip from TikTok provider (placeholder until API key)."""
+    provider = TikTokMetricsProvider()
+    if not provider.available():
+        logging.info("[TikTok] detect_new_clip_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
+        return
+
+
+async def refresh_tiktok_stats_job(context: CallbackContext) -> None:
+    """Every 12h: refresh stats for known clip links (placeholder until API key)."""
+    provider = TikTokMetricsProvider()
+    if not provider.available():
+        logging.info("[TikTok] refresh_tiktok_stats_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
+        return
+
+
 async def morning_kpi_warning_job(context: CallbackContext) -> None:
     """Gửi cảnh báo KPI mỗi sáng 8:30 — tiến độ tuần."""
     app = context.application
@@ -1396,6 +1963,33 @@ def _register_jobs(app: Application) -> None:
         days=(4,),  # 4 = Friday (APScheduler: 0=Mon)
     )
 
+    # Daily KPI formula refresh (from LỊCH ĐĂNG -> KPI monthly table)
+    jq.run_daily(
+        kpi_formula_refresh_job,
+        time=datetime.strptime("00:10", "%H:%M").time(),
+    )
+
+    # Saturday 08:00: build weekly report and send Telegram summary
+    jq.run_daily(
+        saturday_weekly_report_job,
+        time=datetime.strptime("08:00", "%H:%M").time(),
+        days=(5,),  # Saturday
+    )
+
+    # Every 6h: detect new clips (provider placeholder)
+    jq.run_repeating(
+        detect_new_clip_job,
+        interval=timedelta(hours=6),
+        first=timedelta(minutes=3),
+    )
+
+    # Every 12h: refresh stats for known clips (provider placeholder)
+    jq.run_repeating(
+        refresh_tiktok_stats_job,
+        interval=timedelta(hours=12),
+        first=timedelta(minutes=7),
+    )
+
 
 def build_application(token: str, workspace_root: Path) -> Application:
     app = Application.builder().token(token).build()
@@ -1419,6 +2013,7 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("lead_report", cmd_lead_report))
     app.add_handler(CommandHandler("content_ideas", cmd_content_ideas))
     app.add_handler(CommandHandler("log_stats", cmd_log_stats))
+    app.add_handler(CommandHandler("brief", cmd_brief))
 
     _register_jobs(app)
     return app
