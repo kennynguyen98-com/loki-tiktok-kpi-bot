@@ -2161,6 +2161,79 @@ def build_application(token: str, workspace_root: Path) -> Application:
     return app
 
 
+def _sync_state_from_sheet(state_path: Path) -> None:
+    """On startup, rebuild state.json records from LỊCH ĐĂNG sheet.
+
+    This ensures Railway ephemeral filesystem losses don't zero out KPI data.
+    Only fills records that are missing locally — does not overwrite existing.
+    """
+    sh = _sheet_open()
+    if sh is None:
+        logging.warning("[Sync] Cannot open sheet for startup state sync")
+        return
+
+    try:
+        rows, header, header_row_idx = _collect_schedule_rows(sh)
+        if rows is None or header is None:
+            logging.warning("[Sync] LỊCH ĐĂNG header not found")
+            return
+
+        c_num = _find_col(header, "CLIP #", "#")
+        c_title = _find_col(header, "CHỦ ĐỀ / TIÊU ĐỀ", "TIÊU ĐỀ")
+        c_date = _find_col(header, "NGÀY ĐĂNG")
+        c_view2h = _find_col(header, "View 2h")
+        c_posted = _find_col(header, "Giờ đăng thực tế")
+
+        if c_num is None or c_date is None:
+            return
+
+        state = _load_state(state_path)
+        max_id = int(state.get("next_clip_id", 1)) - 1
+        added = 0
+
+        for row in rows:
+            num_val = (row[c_num] if c_num < len(row) else "").strip()
+            if not num_val:
+                continue
+            try:
+                clip_id = int(num_val)
+            except ValueError:
+                continue
+
+            d = _parse_sheet_date(row[c_date] if c_date < len(row) else "")
+            if d is None:
+                continue
+
+            mk = _month_key(d)
+            state.setdefault("records", {})
+            state["records"].setdefault(mk, [])
+
+            # Skip if already recorded locally
+            existing_ids = {int(r.get("id", -1)) for r in state["records"][mk]}
+            if clip_id in existing_ids:
+                continue
+
+            views = _to_int_safe(row[c_view2h] if c_view2h is not None and c_view2h < len(row) else "")
+            title = (row[c_title] if c_title is not None and c_title < len(row) else "").strip()
+
+            state["records"][mk].append({
+                "id": clip_id,
+                "date": d.isoformat(),
+                "views": views,
+                "title": title,
+                "created_at": d.isoformat(),
+                "source": "sheet_sync",
+            })
+            max_id = max(max_id, clip_id)
+            added += 1
+
+        state["next_clip_id"] = max_id + 1
+        _save_state(state_path, state)
+        logging.info(f"[Sync] Startup sheet sync: {added} clip(s) loaded into state")
+    except Exception as exc:
+        logging.warning(f"[Sync] Startup sheet sync error: {exc}")
+
+
 def main() -> None:
     workspace_root = Path(__file__).resolve().parents[1]
     _load_env(workspace_root)
@@ -2177,6 +2250,10 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     _log_sheet_health()
+
+    # Sync state from sheet on startup to survive Railway ephemeral restarts
+    state_path = _state_file(workspace_root)
+    _sync_state_from_sheet(state_path)
 
     app = build_application(token=token, workspace_root=workspace_root)
 
