@@ -364,6 +364,7 @@ def _sheet_write_clip(
             ws.batch_update(updates, value_input_option="RAW")
 
         _sheet_refresh_dashboard_loki(sh)
+        _sheet_apply_kpi_month_formulas(sh, clip_day)
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_write_clip error: {exc}")
@@ -439,6 +440,7 @@ def _sheet_update_stats(
 
         # Keep DASHBOARD KÊNH in sync with LỊCH ĐĂNG after every stats update.
         _sheet_refresh_dashboard_loki(sh)
+        _sheet_apply_kpi_month_formulas(sh)
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_update_stats error: {exc}")
@@ -484,7 +486,8 @@ def _sheet_apply_kpi_month_formulas(sh, target_day: Optional[date] = None) -> bo
             return False
 
         d = target_day or date.today()
-        month_col = 2 + d.month  # B=2 is KPI name, C=3 is unit, T4 starts at D=4
+        # Table layout is fixed: Tháng 4..12 are columns D..L.
+        month_col = d.month
         if month_col < 4 or month_col > 12:
             return False
 
