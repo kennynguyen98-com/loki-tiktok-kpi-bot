@@ -458,9 +458,13 @@ def _parse_sheet_date(text: str) -> Optional[date]:
     s = (text or "").strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m"):
         try:
-            return datetime.strptime(s, fmt).date()
+            d = datetime.strptime(s, fmt).date()
+            # dd/mm without year: assume current year
+            if fmt == "%d/%m":
+                d = d.replace(year=date.today().year)
+            return d
         except ValueError:
             continue
     return None
