@@ -6,6 +6,8 @@ import math
 import os
 import asyncio
 import base64
+import re
+import requests
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -37,6 +39,18 @@ WEEKLY_TARGET = 5  # clip/week
 SAFE_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 DEFAULT_REMINDER_TIMES = "09:00,13:00,20:30"
 DEFAULT_ENABLE_PAID_PHASE2 = "false"
+APPROVED_SCRIPT_STATUS_KEYWORDS = {
+    "đã duyệt",
+    "da duyet",
+    "duyệt",
+    "duyet",
+    "approved",
+    "ok",
+    "đã đăng",
+    "da dang",
+    "posted",
+    "done",
+}
 
 
 @dataclass
@@ -284,6 +298,108 @@ def _find_col(header: List[str], *names: str) -> Optional[int]:
     return None
 
 
+def _parse_clip_number_text(raw: str) -> Optional[int]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    s = s.replace("#", "").strip()
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _is_script_status_approved(raw: str) -> bool:
+    status = (raw or "").strip().casefold()
+    if not status:
+        return False
+    return any(key in status for key in APPROVED_SCRIPT_STATUS_KEYWORDS)
+
+
+def _find_script_header_row(values: List[List[str]]) -> Optional[int]:
+    for i, row in enumerate(values, start=1):
+        norm = [(cell or "").strip().casefold() for cell in row]
+        has_video = "video #" in norm
+        has_status = "trạng thái" in norm or "trang thai" in norm
+        if has_video and has_status:
+            return i
+    return None
+
+
+def _get_approved_script_entry(sh, clip_id: int) -> tuple[bool, str, Optional[str]]:
+    """Return approved SCRIPT title for clip_id.
+
+    Output: (ok, message, title)
+    """
+    try:
+        ws = _ws_like(sh, "SCRIPT")
+        if ws is None:
+            return False, "Không tìm thấy tab SCRIPT", None
+
+        values = ws.get_all_values()
+        header_row_idx = _find_script_header_row(values)
+        if header_row_idx is None:
+            return False, "Không tìm thấy header trong tab SCRIPT", None
+
+        header = values[header_row_idx - 1]
+        c_video = _find_col(header, "Video #")
+        c_title = _find_col(header, "Tiêu đề", "Tiêu Đề")
+        c_status = _find_col(header, "Trạng Thái", "Trạng thái", "Trang Thai")
+        if c_video is None or c_title is None or c_status is None:
+            return False, "Tab SCRIPT thiếu cột Video # / Tiêu đề / Trạng Thái", None
+
+        for row in values[header_row_idx:]:
+            video_val = row[c_video] if c_video < len(row) else ""
+            video_num = _parse_clip_number_text(video_val)
+            if video_num != clip_id:
+                continue
+
+            title = (row[c_title] if c_title < len(row) else "").strip()
+            status = (row[c_status] if c_status < len(row) else "").strip()
+            if not _is_script_status_approved(status):
+                return (
+                    False,
+                    f"Clip #{clip_id} trong SCRIPT chưa duyệt (Trạng Thái: '{status or 'trống'}')",
+                    None,
+                )
+            if not title:
+                return False, f"Clip #{clip_id} trong SCRIPT chưa có Tiêu đề", None
+            return True, "OK", title
+
+        return False, f"Không thấy clip #{clip_id} trong tab SCRIPT", None
+    except Exception as exc:
+        return False, f"Lỗi đọc tab SCRIPT: {exc}", None
+
+
+def _approved_script_clip_ids(sh) -> set[int]:
+    try:
+        ws = _ws_like(sh, "SCRIPT")
+        if ws is None:
+            return set()
+        values = ws.get_all_values()
+        header_row_idx = _find_script_header_row(values)
+        if header_row_idx is None:
+            return set()
+        header = values[header_row_idx - 1]
+        c_video = _find_col(header, "Video #")
+        c_status = _find_col(header, "Trạng Thái", "Trạng thái", "Trang Thai")
+        if c_video is None or c_status is None:
+            return set()
+
+        out: set[int] = set()
+        for row in values[header_row_idx:]:
+            video_val = row[c_video] if c_video < len(row) else ""
+            status = row[c_status] if c_status < len(row) else ""
+            video_num = _parse_clip_number_text(video_val)
+            if video_num is None:
+                continue
+            if _is_script_status_approved(status):
+                out.add(video_num)
+        return out
+    except Exception:
+        return set()
+
+
 def _find_schedule_header_row(values: List[List[str]]) -> Optional[int]:
     """Locate the header row for LỊCH ĐĂNG even when the sheet uses '#' instead of 'CLIP #'"""
     for i, row in enumerate(values, start=1):
@@ -300,6 +416,7 @@ def _sheet_write_clip(
     clip_day: date,
     posted_at: datetime,
     title: str = "",
+    link: str = "",
 ) -> bool:
     """Write a new clip row (or update existing) in LỊCH ĐĂNG sheet."""
     sh = _sheet_open()
@@ -323,6 +440,7 @@ def _sheet_write_clip(
         c_date = _find_col(header, "NGÀY ĐĂNG")
         c_posted = _find_col(header, "Giờ đăng thực tế")
         c_check2h = _find_col(header, "Giờ check +2h")
+        c_link_tiktok = _find_col(header, "LINK TikTok VN", "LINK TikTok")
         c_agent = _find_col(header, "Agent note")
 
         # Find existing row for this clip number
@@ -350,7 +468,6 @@ def _sheet_write_clip(
             posted_at.year, posted_at.month, posted_at.day,
             posted_at.hour, posted_at.minute
         )
-        from datetime import timedelta
         check_2h = check_time + timedelta(hours=2)
 
         updates = []
@@ -364,6 +481,8 @@ def _sheet_write_clip(
             updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_posted + 1), "values": [[posted_at.strftime("%H:%M")]]})
         if c_check2h is not None:
             updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_check2h + 1), "values": [[check_2h.strftime("%H:%M")]]})
+        if c_link_tiktok is not None and link:
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_link_tiktok + 1), "values": [[link]]})
         if c_agent is not None:
             updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_agent + 1), "values": [["⏳ Chờ check 2h"]]})
 
@@ -451,6 +570,51 @@ def _sheet_update_stats(
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_update_stats error: {exc}")
+        return False
+
+
+def _sheet_set_views_only(clip_id: int, views: int) -> bool:
+    """Update only View 2h in LỊCH ĐĂNG then refresh Dashboard/KPI."""
+    sh = _sheet_open()
+    if sh is None:
+        return False
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            return False
+
+        values = ws.get_all_values()
+        header_row_idx = _find_schedule_header_row(values)
+        if header_row_idx is None:
+            return False
+
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_view2h = _find_col(header, "View 2h")
+        if c_num is None or c_view2h is None:
+            return False
+
+        target_row = None
+        for r_idx in range(header_row_idx + 1, len(values) + 1):
+            row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+            num_val = row[c_num] if c_num < len(row) else ""
+            if (num_val or "").strip() == str(clip_id):
+                target_row = r_idx
+                break
+
+        if target_row is None:
+            return False
+
+        ws.update(
+            range_name=gspread.utils.rowcol_to_a1(target_row, c_view2h + 1),
+            values=[[views]],
+            value_input_option="RAW",
+        )
+        _sheet_refresh_dashboard_loki(sh)
+        _sheet_apply_kpi_month_formulas(sh)
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_set_views_only error: {exc}")
         return False
 
 
@@ -590,10 +754,18 @@ def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
                 continue
             week_rows.append(row)
 
+        approved_script_ids = _approved_script_clip_ids(sh)
+
         clips = len(week_rows)
         total_views = sum(_to_int_safe(row[c_views] if c_views < len(row) else "") for row in week_rows)
         ge10k = sum(1 for row in week_rows if _to_int_safe(row[c_views] if c_views < len(row) else "") >= 10000)
         ge5k = sum(1 for row in week_rows if _to_int_safe(row[c_views] if c_views < len(row) else "") >= 5000)
+        approved_posted_scripts = 0
+        for row in week_rows:
+            num_val = row[c_num] if c_num < len(row) else ""
+            n = _parse_clip_number_text(num_val)
+            if n is not None and n in approved_script_ids:
+                approved_posted_scripts += 1
 
         # Header info row
         week_no = week_start.isocalendar().week
@@ -616,7 +788,7 @@ def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
             9: total_views,
             10: ge10k,
             11: ge5k,
-            12: max(0, clips),
+            12: approved_posted_scripts,
         }
 
         for r in [8, 9, 10, 11, 12]:
@@ -653,17 +825,24 @@ def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
                 ])
 
         # Section C quick diagnosis row 22
-        if clips < 5:
-            issue, cause, action = "Thiếu số clip", "Tần suất đăng chưa đủ", "Ưu tiên 1-2 clip/ngày trong 3 ngày tới"
-        elif total_views < 7500:
-            issue, cause, action = "View thấp", "Hook/thumbnail chưa đủ mạnh", "A/B test hook 2s đầu + caption CTA rõ hơn"
+        if approved_posted_scripts <= 0:
+            updates.extend([
+                {"range": "B22", "values": [["Chỉ tổng hợp số liệu thực tế"]]},
+                {"range": "C22", "values": [["Chưa có SCRIPT duyệt"]]},
+                {"range": "D22:G22", "values": [["", "", "", ""]]},
+            ])
         else:
-            issue, cause, action = "On track", "KPI tuần đạt", "Giữ nhịp đều và tập trung clip có khả năng >=5K"
-        updates.extend([
-            {"range": "B22", "values": [[issue]]},
-            {"range": "C22", "values": [[cause]]},
-            {"range": "D22:G22", "values": [[action, "", "", ""]]},
-        ])
+            if clips < 5:
+                issue, cause, action = "Thiếu số clip", "Tần suất đăng chưa đủ", "Ưu tiên 1-2 clip/ngày trong 3 ngày tới"
+            elif total_views < 7500:
+                issue, cause, action = "View thấp", "Hook/thumbnail chưa đủ mạnh", "A/B test hook 2s đầu + caption CTA rõ hơn"
+            else:
+                issue, cause, action = "On track", "KPI tuần đạt", "Giữ nhịp đều và tập trung clip có khả năng >=5K"
+            updates.extend([
+                {"range": "B22", "values": [[issue]]},
+                {"range": "C22", "values": [[cause]]},
+                {"range": "D22:G22", "values": [[action, "", "", ""]]},
+            ])
 
         ws.batch_update(updates, value_input_option="USER_ENTERED")
         return True
@@ -871,7 +1050,7 @@ def _sheet_refresh_dashboard_loki(sh) -> bool:
             return False
 
         metric_rows = {}
-        for i in range(loki_title_row + 1, min(loki_title_row + 12, len(dash_vals) + 1)):
+        for i in range(loki_title_row + 1, min(loki_title_row + 25, len(dash_vals) + 1)):
             row = dash_vals[i - 1]
             metric = (row[1] if len(row) > 1 else "").strip().casefold()
             if metric:
@@ -894,8 +1073,26 @@ def _sheet_refresh_dashboard_loki(sh) -> bool:
         row_likes = metric_rows.get("likes")
         row_comments = metric_rows.get("comments")
         row_followers = metric_rows.get("followers")
-        row_clips = metric_rows.get("clip đăng")
+        row_clips = metric_rows.get("clip đăng") or metric_rows.get("clip dang")
         row_avg = metric_rows.get("views/clip tb")
+        row_kpi_target = metric_rows.get("kpi target tháng") or metric_rows.get("kpi target thang")
+        row_gap_views = metric_rows.get("gap views (tháng)") or metric_rows.get("gap views (thang)")
+        row_gap_clips = metric_rows.get("gap clips (tháng)") or metric_rows.get("gap clips (thang)")
+        row_pct_views = metric_rows.get("% views to 30k")
+        row_pct_clips = metric_rows.get("% clips to 20")
+        row_kpi_week = (
+            metric_rows.get("kpi tuần")
+            or metric_rows.get("kpi tuan")
+            or metric_rows.get("kpi tuần (clip)")
+            or metric_rows.get("kpi tuan (clip)")
+        )
+        row_gap_week = (
+            metric_rows.get("gap kpi tuần")
+            or metric_rows.get("gap kpi tuan")
+            or metric_rows.get("gap kpi tuần (clip)")
+            or metric_rows.get("gap kpi tuan (clip)")
+        )
+        row_last_updated = metric_rows.get("cập nhật lúc") or metric_rows.get("cap nhat luc")
 
         for row_idx, vals in [
             (row_views, series("views")),
@@ -909,6 +1106,47 @@ def _sheet_refresh_dashboard_loki(sh) -> bool:
                 continue
             # C:G = HÔM NAY..NĂM NAY
             updates.append({"range": f"C{row_idx}:G{row_idx}", "values": [vals]})
+
+        # KPI rows use column E = THÁNG NÀY
+        if row_kpi_target:
+            updates.append({"range": f"E{row_kpi_target}", "values": [["20 clip / 30.000 view"]]})
+
+        # Gap views (tháng) = max(0, 30000 - current month views)
+        if row_gap_views:
+            month_views = buckets["month"]["views"]
+            gap_views = max(0, 30000 - month_views)
+            updates.append({"range": f"E{row_gap_views}", "values": [[gap_views]]})
+
+        # Gap clips (tháng) = max(0, 20 - current month clips)
+        if row_gap_clips:
+            month_clips = buckets["month"]["clips"]
+            gap_clips = max(0, 20 - month_clips)
+            updates.append({"range": f"E{row_gap_clips}", "values": [[gap_clips]]})
+
+        # % views to 30k
+        if row_pct_views:
+            month_views = buckets["month"]["views"]
+            pct_views = round((month_views / 30000 * 100), 1) if month_views > 0 else 0
+            updates.append({"range": f"E{row_pct_views}", "values": [[f"{pct_views}%"]]})
+
+        # % clips to 20
+        if row_pct_clips:
+            month_clips = buckets["month"]["clips"]
+            pct_clips = round((month_clips / 20 * 100), 1) if month_clips > 0 else 0
+            updates.append({"range": f"E{row_pct_clips}", "values": [[f"{pct_clips}%"]]})
+
+        # KPI tuần đặt ở cột D = TUẦN NÀY
+        if row_kpi_week:
+            updates.append({"range": f"D{row_kpi_week}", "values": [[f"{WEEKLY_TARGET} clip/tuần"]]})
+
+        if row_gap_week:
+            week_clips = buckets["week"]["clips"]
+            gap_week = max(0, WEEKLY_TARGET - week_clips)
+            updates.append({"range": f"D{row_gap_week}", "values": [[gap_week]]})
+
+        # Last updated marker
+        if row_last_updated:
+            updates.append({"range": f"E{row_last_updated}", "values": [[datetime.now().strftime("%d/%m %H:%M")]]})
 
         if updates:
             ws_dash.batch_update(updates, value_input_option="RAW")
@@ -956,6 +1194,66 @@ def _kpi_warning_text(state: Dict[str, Any]) -> str:
     else:
         lines.append("⚠️ Hôm nay là Chủ nhật - tuần này không đạt mục tiêu!")
     return "\n".join(lines)
+
+
+def _today_report_text(state: Dict[str, Any], target_day: Optional[date] = None) -> str:
+    """Daily recap used in scheduled Telegram reports."""
+    d = target_day or date.today()
+    today_clips = 0
+    today_views = 0
+
+    for month_rows in state.get("records", {}).values():
+        for row in month_rows:
+            try:
+                posted_day = date.fromisoformat(str(row.get("date", "")))
+            except ValueError:
+                continue
+            if posted_day != d:
+                continue
+            today_clips += 1
+            today_views += int(row.get("views", 0) or 0)
+
+    now_stats = _stats_for_month(state, _month_key(d))
+    clip_gap = max(0, TARGET_CLIPS - now_stats.clip_count)
+    view_gap = max(0, TARGET_VIEWS - now_stats.total_views)
+
+    lines = [
+        f"BÁO CÁO NGÀY {d.strftime('%d/%m/%Y')}",
+        f"- Hôm nay đăng: {today_clips} clip",
+        f"- View từ clip đăng hôm nay: {today_views:,}",
+        f"- KPI tháng còn thiếu: {clip_gap} clip | {view_gap:,} view",
+    ]
+    if today_clips == 0:
+        lines.append("- CẢNH BÁO: Hôm nay chưa có clip mới.")
+    if today_clips > 0 and today_views < 1000:
+        lines.append("- CẢNH BÁO: View clip hôm nay đang thấp (<1.000).")
+    if clip_gap == 0 and view_gap == 0:
+        lines.append("- Trạng thái: Đã đạt KPI tháng.")
+    return "\n".join(lines)
+
+
+def _latest_clip_datetime(state: Dict[str, Any]) -> Optional[datetime]:
+    """Get latest clip timestamp from local state records."""
+    latest: Optional[datetime] = None
+    for rows in state.get("records", {}).values():
+        for row in rows:
+            dt_val: Optional[datetime] = None
+            created_raw = str(row.get("created_at", "") or "").strip()
+            if created_raw:
+                try:
+                    dt_val = datetime.fromisoformat(created_raw)
+                except ValueError:
+                    dt_val = None
+            if dt_val is None:
+                date_raw = str(row.get("date", "") or "").strip()
+                if date_raw:
+                    try:
+                        dt_val = datetime.combine(date.fromisoformat(date_raw), datetime.min.time())
+                    except ValueError:
+                        dt_val = None
+            if dt_val is not None and (latest is None or dt_val > latest):
+                latest = dt_val
+    return latest
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1390,8 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
     help_text = (
         "📊 LỆNH KPI:\n"
         "/status - Xem tiến độ KPI tháng hiện tại\n"
-        "/add_clip <views> [yyyy-mm-dd] - Thêm 1 clip\n"
+        "/add_clip <views> [yyyy-mm-dd] - Thêm 1 clip theo SCRIPT đã duyệt\n"
+        "/log_clip <id> <view> <like> <cmt> [yyyy-mm-dd] [hh:mm] - Nhập nhanh clip đã đăng\n"
         "/set_views <clip_id> <views> - Sửa views của clip\n"
         "/remove_clip <clip_id> - Xóa clip khỏi thống kê\n"
         "/list_clips - Liệt kê clip trong tháng\n"
@@ -1113,7 +1412,8 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "/phase2_status - Kiểm tra trạng thái API TikTok\n"
         "/phase2_scan_now - Chạy detect+refresh ngay\n\n"
         "📊 STATS 2H:\n"
-        "/log_stats <id> <view> <like> <cmt> <share> <flw> - Nhập số liệu 2h sau đăng"
+        "/log_stats <id> <view> <like> <cmt> <share> <flw> - Nhập số liệu 2h sau đăng\n"
+        "/report_now - Gửi báo cáo tuần ngay"
     )
     await update.message.reply_text(help_text)
 
@@ -1155,12 +1455,12 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(_reject_text())
         return
 
-    # Usage: /add_clip <views> [yyyy-mm-dd] [title...]
+    # Usage: /add_clip <views> [yyyy-mm-dd]
     if not context.args:
         await update.message.reply_text(
-            "Dùng: /add_clip <views> [yyyy-mm-dd] [tên clip]\n"
-            "Ví dụ: /add_clip 0 2026-05-07 Học AI\n"
-            "(views = 0 lúc mới đăng, điền số thật sau 2h khi bot nhắc)"
+            "Dùng: /add_clip <views> [yyyy-mm-dd]\n"
+            "Ví dụ: /add_clip 0 2026-05-07\n"
+            "(Tiêu đề lấy từ tab SCRIPT đã duyệt theo đúng số clip.)"
         )
         return
 
@@ -1188,9 +1488,26 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
     state["records"].setdefault(mk, [])
 
     clip_id = int(state.get("next_clip_id", 1))
+
+    sh = _sheet_open()
+    if sh is None:
+        await update.message.reply_text("Không kết nối được Google Sheet. Chưa thể xác minh SCRIPT đã duyệt.")
+        return
+
+    ok_script, script_msg, script_title = _get_approved_script_entry(sh, clip_id)
+    if not ok_script or not script_title:
+        await update.message.reply_text(
+            "❌ Không thể thêm clip mới theo rule chuẩn.\n"
+            f"- Clip dự kiến: #{clip_id}\n"
+            f"- Lý do: {script_msg}\n"
+            "Hãy duyệt đúng dòng trong tab SCRIPT trước khi /add_clip."
+        )
+        return
+
     state["next_clip_id"] = clip_id + 1
     posted_at = datetime.now()
 
+    title = script_title
     state["records"][mk].append(
         {
             "id": clip_id,
@@ -1211,7 +1528,7 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
     }
     _save_state(state_path, state)
 
-    # Write to Google Sheet
+    # Write to Google Sheet (SCRIPT -> LỊCH ĐĂNG)
     sheet_ok = _sheet_write_clip(clip_id, clip_day, posted_at, title)
     sheet_note = " (Sheet: đã kết nối, đã ghi vào sheet)" if sheet_ok else " (Sheet: chưa kết nối)"
 
@@ -1239,6 +1556,127 @@ async def cmd_add_clip(update: Update, context: CallbackContext) -> None:
         msg_lines.append(f"\n🎉 Tuần này đã đủ {WEEKLY_TARGET} clip!")
 
     await update.message.reply_text("\n".join(msg_lines))
+
+
+async def cmd_log_clip(update: Update, context: CallbackContext) -> None:
+    """Quick one-line update: date + views + likes + comments for a posted clip."""
+    if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        return
+
+    state_path: Path = context.bot_data["state_path"]
+    state = _load_state(state_path)
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    usage = "Dùng: /log_clip <clip_id> <views> <likes> <comments> [yyyy-mm-dd] [hh:mm]"
+    if len(context.args) < 4:
+        await update.message.reply_text(usage)
+        return
+
+    try:
+        clip_id = int(context.args[0])
+        views = int(context.args[1])
+        likes = int(context.args[2])
+        comments = int(context.args[3])
+        if min(clip_id, views, likes, comments) < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(usage)
+        return
+
+    clip_day = date.today()
+    if len(context.args) >= 5:
+        try:
+            clip_day = _parse_date(context.args[4])
+        except ValueError:
+            await update.message.reply_text(usage)
+            return
+
+    post_time = datetime.now().time().replace(second=0, microsecond=0)
+    if len(context.args) >= 6:
+        try:
+            hh, mm = context.args[5].split(":", 1)
+            post_time = datetime.strptime(f"{int(hh):02d}:{int(mm):02d}", "%H:%M").time()
+        except Exception:
+            await update.message.reply_text(usage)
+            return
+
+    posted_at = datetime.combine(clip_day, post_time)
+
+    sh = _sheet_open()
+    if sh is None:
+        await update.message.reply_text("Không kết nối được Google Sheet. Chưa thể kiểm tra SCRIPT đã duyệt.")
+        return
+
+    ok_script, script_msg, script_title = _get_approved_script_entry(sh, clip_id)
+    if not ok_script or not script_title:
+        await update.message.reply_text(
+            "❌ Không thể ghi clip theo rule chuẩn.\n"
+            f"- Clip #{clip_id}\n"
+            f"- Lý do: {script_msg}\n"
+            "Chỉ nhận clip có nội dung đã duyệt trong tab SCRIPT."
+        )
+        return
+
+    mk = _month_key(clip_day)
+    state.setdefault("records", {})
+    state["records"].setdefault(mk, [])
+
+    found = False
+    for rows in state.get("records", {}).values():
+        for row in rows:
+            if int(row.get("id", -1)) == clip_id:
+                row["date"] = clip_day.isoformat()
+                row["views"] = views
+                row["title"] = script_title
+                row["likes_2h"] = likes
+                row["comments_2h"] = comments
+                row["shares_2h"] = int(row.get("shares_2h", 0) or 0)
+                row["followers_2h"] = int(row.get("followers_2h", 0) or 0)
+                row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                found = True
+                break
+        if found:
+            break
+
+    if not found:
+        state["records"][mk].append(
+            {
+                "id": clip_id,
+                "date": clip_day.isoformat(),
+                "views": views,
+                "title": script_title,
+                "created_at": posted_at.isoformat(timespec="seconds"),
+                "likes_2h": likes,
+                "comments_2h": comments,
+                "shares_2h": 0,
+                "followers_2h": 0,
+            }
+        )
+
+    state["next_clip_id"] = max(int(state.get("next_clip_id", 1)), clip_id + 1)
+    state["pending_2h_checks"].pop(str(clip_id), None)
+    _save_state(state_path, state)
+
+    sheet_write_ok = _sheet_write_clip(clip_id, clip_day, posted_at, script_title)
+    sheet_stats_ok = _sheet_update_stats(clip_id, views, likes, comments, 0, 0)
+    sheet_ok = sheet_write_ok and sheet_stats_ok
+
+    status_text = "✅ Đã cập nhật LỊCH ĐĂNG + KPI + Dashboard" if sheet_ok else "⚠️ Đã lưu local, sheet cập nhật chưa trọn vẹn"
+    await update.message.reply_text(
+        "\n".join(
+            [
+                f"✅ Đã nhập nhanh clip #{clip_id}",
+                f"- Ngày đăng: {clip_day.isoformat()} {post_time.strftime('%H:%M')}",
+                f"- View: {views:,} | Like: {likes} | Comment: {comments}",
+                f"- Tiêu đề: {script_title}",
+                status_text,
+                "",
+                _progress_text(state, clip_day),
+            ]
+        )
+    )
 
 
 async def cmd_log_stats(update: Update, context: CallbackContext) -> None:
@@ -1349,7 +1787,12 @@ async def cmd_set_views(update: Update, context: CallbackContext) -> None:
         return
 
     _save_state(state_path, state)
-    await update.message.reply_text(f"Đã cập nhật clip #{clip_id} -> {views:,} view.\n\n{_progress_text(state)}")
+    sheet_ok = _sheet_set_views_only(clip_id, views)
+    await update.message.reply_text(
+        f"Đã cập nhật clip #{clip_id} -> {views:,} view."
+        f"\n{'✅ Đã sync Dashboard + KPI ngay.' if sheet_ok else '⚠️ Chưa sync được sheet ngay.'}"
+        f"\n\n{_progress_text(state)}"
+    )
 
 
 async def cmd_remove_clip(update: Update, context: CallbackContext) -> None:
@@ -1757,18 +2200,18 @@ async def cmd_brief(update: Update, context: CallbackContext) -> None:
 def _phase2_status_text() -> str:
     provider = TikTokMetricsProvider()
     rapid = "✅" if provider.rapidapi_key else "❌"
-    tikapi = "✅" if provider.tikapi_key else "❌"
     paid_enabled = _paid_phase2_enabled()
     paid_ready = paid_enabled and provider.available()
+    refresh_hours = max(1, int(os.getenv("TG_TIKTOK_REFRESH_HOURS", "12")))
     return (
         "🧩 PHASE 2 STATUS\n"
         f"- Free-first mode: {'✅ Bật' if not paid_enabled else '⚠️ Tắt'}\n"
         f"- ENABLE_PAID_PHASE2: {'✅' if paid_enabled else '❌'}\n"
         f"- RAPIDAPI_KEY: {rapid}\n"
-        f"- TIKAPI_KEY: {tikapi}\n"
+        f"- RAPIDAPI_HOST: {provider.host}\n"
         f"- Provider sẵn sàng: {'✅ Có' if paid_ready else '❌ Chưa'}\n"
         "- Detect clip mới: mỗi 6h\n"
-        "- Refresh stats: mỗi 12h\n"
+        f"- Refresh stats: mỗi {refresh_hours}h\n"
         "- Test tay: /phase2_scan_now\n"
         "- Miễn phí: /free_refresh"
     )
@@ -1805,7 +2248,8 @@ async def cmd_free_status(update: Update, context: CallbackContext) -> None:
         "🆓 FREE MODE STATUS\n"
         f"- Chế độ miễn phí: {'✅ Đang bật' if not paid_enabled else '⚠️ Đang tắt'}\n"
         "- Không dùng RapidAPI/TikAPI để tính KPI\n"
-        "- Nguồn KPI: /add_clip + /log_stats + LỊCH ĐĂNG\n"
+        "- Luồng dữ liệu chuẩn: SCRIPT(đã duyệt) -> LỊCH ĐĂNG -> KPI\n"
+        "- Nguồn KPI: /add_clip, /log_clip, /log_stats + LỊCH ĐĂNG\n"
         "- Lệnh nên dùng: /free_refresh, /status, /weekly_review"
     )
 
@@ -1858,24 +2302,361 @@ async def cmd_phase2_scan_now(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text("✅ Đã chạy scan Phase 2 thủ công (detect + refresh).")
 
 
+# ---------------------------------------------------------------------------
+# Auto-job helpers: channel info, schedule link index, stats update
+# ---------------------------------------------------------------------------
+
+def _read_tiktok_loki_handle(sh) -> Optional[str]:
+    """Read the active TikTok VN handle (@loki_tran) from the Thông tin tab."""
+    try:
+        ws = _ws_like(sh, "Thông tin")
+        if ws is None:
+            logging.warning("[Sheet] Thông tin tab not found")
+            return None
+        values = ws.get_all_values()
+        # Find header row (has NỀN TẢNG and LINK)
+        header_row_idx = None
+        for i, row in enumerate(values, start=1):
+            norm = [(c or "").strip().casefold() for c in row]
+            if "nền tảng" in norm and "link" in norm:
+                header_row_idx = i
+                break
+        if header_row_idx is None:
+            # Fall back: scan all rows for tiktok.com/@
+            for row in values:
+                for cell in row:
+                    m = re.search(r"tiktok\.com/@([^/?\s]+)", (cell or ""))
+                    if m:
+                        return m.group(1)
+            return None
+        header = values[header_row_idx - 1]
+        c_platform = _find_col(header, "NỀN TẢNG", "Nền tảng")
+        c_link = _find_col(header, "LINK", "Link")
+        c_status = _find_col(header, "TRẠNG THÁI", "Trạng thái")
+        for row in values[header_row_idx:]:
+            platform = (row[c_platform] if c_platform is not None and c_platform < len(row) else "").strip()
+            link = (row[c_link] if c_link is not None and c_link < len(row) else "").strip()
+            status = (row[c_status] if c_status is not None and c_status < len(row) else "").strip()
+            if ("tiktok" in platform.lower() and "vn" in platform.lower()) or "tiktok vn" in platform.lower():
+                if "hoạt động" in status.lower() or "hoat dong" in status.lower():
+                    m = re.search(r"tiktok\.com/@([^/?\s]+)", link)
+                    if m:
+                        return m.group(1)
+        return None
+    except Exception as exc:
+        logging.warning(f"[Sheet] _read_tiktok_loki_handle error: {exc}")
+        return None
+
+
+def _sheet_read_schedule_links(sh) -> Dict[str, int]:
+    """Return {tiktok_vn_link: clip_id} for rows that already have a TikTok link."""
+    result: Dict[str, int] = {}
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            return result
+        values = ws.get_all_values()
+        header_row_idx = _find_schedule_header_row(values)
+        if header_row_idx is None:
+            return result
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_link = _find_col(header, "LINK TikTok VN", "LINK TikTok")
+        if c_num is None or c_link is None:
+            return result
+        for row in values[header_row_idx:]:
+            num = (row[c_num] if c_num < len(row) else "").strip()
+            link = (row[c_link] if c_link < len(row) else "").strip()
+            if num and link and "tiktok.com" in link:
+                try:
+                    result[link] = int(num)
+                except ValueError:
+                    pass
+        return result
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_read_schedule_links error: {exc}")
+        return result
+
+
+def _next_available_schedule_id(sh) -> Optional[int]:
+    """Return the lowest clip # in LỊCH ĐĂNG that has no NGÀY ĐĂNG yet."""
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            return None
+        values = ws.get_all_values()
+        header_row_idx = _find_schedule_header_row(values)
+        if header_row_idx is None:
+            return None
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_date = _find_col(header, "NGÀY ĐĂNG")
+        if c_num is None:
+            return None
+        for row in values[header_row_idx:]:
+            num = (row[c_num] if c_num < len(row) else "").strip()
+            date_val = (row[c_date] if c_date is not None and c_date < len(row) else "").strip() if c_date else ""
+            if num and not date_val:
+                try:
+                    return int(num)
+                except ValueError:
+                    pass
+        return None
+    except Exception as exc:
+        logging.warning(f"[Sheet] _next_available_schedule_id error: {exc}")
+        return None
+
+
+def _sheet_auto_update_stats(
+    sh,
+    clip_id: int,
+    views: int,
+    likes: int,
+    comments: int,
+    shares: int,
+) -> bool:
+    """Auto-refresh stats from API — updates numbers + agent note, does NOT mark Đã check 2h?."""
+    try:
+        ws = _ws_like(sh, "LỊCH ĐĂNG")
+        if ws is None:
+            return False
+        values = ws.get_all_values()
+        header_row_idx = _find_schedule_header_row(values)
+        if header_row_idx is None:
+            return False
+        header = values[header_row_idx - 1]
+        c_num = _find_col(header, "CLIP #", "#")
+        c_view2h = _find_col(header, "View 2h")
+        c_like2h = _find_col(header, "Like 2h")
+        c_cmt2h = _find_col(header, "Comment 2h")
+        c_share2h = _find_col(header, "Share 2h")
+        c_agent = _find_col(header, "Agent note")
+
+        target_row = None
+        for r_idx in range(header_row_idx + 1, len(values) + 1):
+            row = values[r_idx - 1] if r_idx - 1 < len(values) else []
+            if (row[c_num] if c_num is not None and c_num < len(row) else "").strip() == str(clip_id):
+                target_row = r_idx
+                break
+        if target_row is None:
+            return False
+
+        updates = []
+        for col, val in [(c_view2h, views), (c_like2h, likes), (c_cmt2h, comments), (c_share2h, shares)]:
+            if col is not None:
+                updates.append({"range": gspread.utils.rowcol_to_a1(target_row, col + 1), "values": [[val]]})
+        if c_agent is not None:
+            eng = round((likes + comments + shares) / max(views, 1) * 100, 1)
+            note = f"🤖 Auto {datetime.now().strftime('%d/%m %H:%M')} | Eng {eng}%"
+            if views >= 10000:
+                note += " 🔥"
+            elif views >= 5000:
+                note += " ✅"
+            elif views > 0 and views < 1000:
+                note += " ⚠️"
+            updates.append({"range": gspread.utils.rowcol_to_a1(target_row, c_agent + 1), "values": [[note]]})
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_auto_update_stats error: {exc}")
+        return False
+
+
 class TikTokMetricsProvider:
-    """Placeholder provider for future RapidAPI/TikAPI integration."""
+    """RapidAPI TikTok adapter.
+
+    Set env var RAPIDAPI_KEY to activate.
+    Optionally set RAPIDAPI_TIKTOK_HOST to override the default API host.
+
+    Default host: tiktok-data-api.p.rapidapi.com
+    Endpoints used:
+      GET /user/posts?username=<handle>&count=20  → recent videos
+      GET /video/info?video_id=<id>               → single video stats
+    """
+
+    _DEFAULT_HOST = "tiktok-data-api.p.rapidapi.com"
 
     def __init__(self) -> None:
-        self.rapidapi_key = os.getenv("RAPIDAPI_KEY", "").strip()
-        self.tikapi_key = os.getenv("TIKAPI_KEY", "").strip()
+        self.rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "").strip()
+        self.host: str = os.getenv("RAPIDAPI_TIKTOK_HOST", self._DEFAULT_HOST).strip()
 
     def available(self) -> bool:
-        return bool(self.rapidapi_key or self.tikapi_key)
+        return bool(self.rapidapi_key)
+
+    def _is_tiktok_api23(self) -> bool:
+        return "tiktok-api23" in (self.host or "")
+
+    # ------------------------------------------------------------------
+    # Internal HTTP helper
+    # ------------------------------------------------------------------
+
+    def _get(self, endpoint: str, params: Dict[str, str]) -> Optional[Any]:
+        """GET request to RapidAPI. Returns parsed JSON or None on error."""
+        url = f"https://{self.host}{endpoint}"
+        headers = {
+            "X-RapidAPI-Key": self.rapidapi_key,
+            "X-RapidAPI-Host": self.host,
+        }
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            logging.warning(f"[RapidAPI] {resp.status_code} from {endpoint}: {resp.text[:300]}")
+            return None
+        except requests.RequestException as exc:
+            logging.warning(f"[RapidAPI] Request failed ({endpoint}): {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Response normalizer — handles multiple common RapidAPI formats
+    # ------------------------------------------------------------------
+
+    def _normalize_video(self, raw: Any, handle: str = "") -> Optional[Dict[str, Any]]:
+        """Normalize a raw video object from various RapidAPI response shapes."""
+        if not isinstance(raw, dict):
+            return None
+
+        # Video ID
+        vid_id = str(raw.get("id") or raw.get("video_id") or raw.get("aweme_id") or "").strip()
+        if not vid_id:
+            return None
+
+        # Title / description
+        title = str(
+            raw.get("desc") or raw.get("description") or raw.get("title") or raw.get("video_description") or ""
+        ).strip()
+
+        # Creation timestamp
+        create_ts_raw = (
+            raw.get("createTime") or raw.get("create_time") or raw.get("created_at")
+            or (raw.get("video") or {}).get("create_time") or 0
+        )
+        try:
+            create_ts = int(create_ts_raw)
+        except (TypeError, ValueError):
+            create_ts = 0
+
+        # Stats block — try several common keys
+        stats = (
+            raw.get("stats") or raw.get("statistics") or raw.get("statistics_v2")
+            or raw.get("stats_v2") or {}
+        )
+        def _int(d: dict, *keys: str) -> int:
+            for k in keys:
+                v = d.get(k)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+            return 0
+
+        views = _int(stats, "playCount", "play_count", "viewCount", "view_count")
+        likes = _int(stats, "diggCount", "like_count", "likeCount", "heart_count")
+        comments = _int(stats, "commentCount", "comment_count")
+        shares = _int(stats, "shareCount", "share_count")
+
+        handle_clean = handle.lstrip("@") if handle else "loki_tran"
+        link = f"https://www.tiktok.com/@{handle_clean}/video/{vid_id}"
+        posted_at = datetime.fromtimestamp(create_ts) if create_ts > 0 else None
+
+        return {
+            "video_id": vid_id,
+            "title": title,
+            "link": link,
+            "posted_at": posted_at,
+            "views": views,
+            "likes": likes,
+            "comments": comments,
+            "shares": shares,
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def detect_recent_posts(self, handle: str, hours_back: int = 6) -> List[Dict[str, Any]]:
-        # Placeholder: return [] until API adapter is connected.
-        _ = (handle, hours_back)
-        return []
+        """Fetch recent videos for *handle*. Returns normalized dicts posted within *hours_back* hours."""
+        if not self.available():
+            return []
+        handle_clean = handle.lstrip("@")
+        if self._is_tiktok_api23():
+            info = self._get("/api/user/info", {"uniqueId": handle_clean})
+            if info is None:
+                return []
+            sec_uid = (
+                ((info.get("userInfo") or {}).get("user") or {}).get("secUid")
+                or info.get("secUid")
+                or ""
+            )
+            if not sec_uid:
+                logging.warning(f"[RapidAPI] Missing secUid for @{handle_clean}")
+                return []
+            data = self._get("/api/user/posts", {"secUid": sec_uid, "count": "20", "cursor": "0"})
+        else:
+            data = self._get("/user/posts", {"username": handle_clean, "count": "20"})
+        if data is None:
+            return []
+        # Unwrap common response envelopes
+        items: List[Any] = (
+            (data.get("data") or {}).get("itemList")
+            or
+            (data.get("data") or {}).get("videos")
+            or (data.get("data") or {}).get("items")
+            or data.get("videos")
+            or data.get("items")
+            or data.get("aweme_list")
+            or []
+        )
+        cutoff = datetime.now() - timedelta(hours=hours_back)
+        results: List[Dict[str, Any]] = []
+        for raw in items:
+            norm = self._normalize_video(raw, handle_clean)
+            if norm and norm["posted_at"] and norm["posted_at"] >= cutoff:
+                results.append(norm)
+        logging.info(f"[RapidAPI] detect_recent_posts @{handle_clean}: {len(items)} total, {len(results)} in last {hours_back}h")
+        return results
 
     def fetch_post_metrics(self, post_url: str) -> Optional[Dict[str, int]]:
-        # Placeholder: return None until API adapter is connected.
-        _ = post_url
+        """Fetch current stats for a TikTok video URL. Returns {views, likes, comments, shares}."""
+        if not self.available():
+            return None
+        # Extract video_id from URL: .../video/1234567890
+        m = re.search(r"/video/(\d+)", post_url)
+        if not m:
+            logging.warning(f"[RapidAPI] Cannot parse video_id from URL: {post_url}")
+            return None
+        video_id = m.group(1)
+        # Extract handle from URL for proper link reconstruction
+        hm = re.search(r"tiktok\.com/@([^/?\s]+)", post_url)
+        handle = hm.group(1) if hm else "loki_tran"
+
+        if self._is_tiktok_api23():
+            data = self._get("/api/post/detail", {"videoId": video_id})
+        else:
+            data = self._get("/video/info", {"video_id": video_id})
+        if data is None:
+            return None
+        # Unwrap common response envelopes
+        raw: Any = (
+            ((data.get("itemInfo") or {}).get("itemStruct"))
+            or
+            data.get("data")
+            or data.get("video")
+            or data.get("aweme_detail")
+            or data
+        )
+        if isinstance(raw, list):
+            raw = raw[0] if raw else {}
+        norm = self._normalize_video(raw, handle)
+        if norm:
+            return {
+                "views": norm["views"],
+                "likes": norm["likes"],
+                "comments": norm["comments"],
+                "shares": norm["shares"],
+            }
         return None
 
 
@@ -1926,26 +2707,301 @@ async def saturday_weekly_report_job(context: CallbackContext) -> None:
     )
 
 
-async def detect_new_clip_job(context: CallbackContext) -> None:
-    """Every 6h: detect new clip from TikTok provider (placeholder until API key)."""
-    if not _paid_phase2_enabled():
-        logging.info("[TikTok] detect_new_clip_job skipped: free-first mode is ON")
+async def weekly_report_sync_only_job(context: CallbackContext) -> None:
+    """Daily sync that updates only tab BÁO CÁO TUẦN."""
+    sh = _sheet_open()
+    if sh is None:
+        logging.warning("[WeeklyReport] Cannot open Google Sheet")
         return
+
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = today
+    ok = _sheet_fill_weekly_report(sh, week_start, week_end)
+    if not ok:
+        logging.warning("[WeeklyReport] Sync failed")
+        return
+
+    # Optional Telegram note to authorized chat
+    try:
+        app = context.application
+        state_path: Path = app.bot_data["state_path"]
+        state = _load_state(state_path)
+        chat_id = state.get("authorized_chat_id")
+        if chat_id is not None:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    "Đã cập nhật BÁO CÁO TUẦN (chỉ tab này).\n"
+                    f"Tuần: {week_start.strftime('%d/%m/%Y')} -> {week_end.strftime('%d/%m/%Y')}"
+                ),
+            )
+    except Exception as exc:
+        logging.warning(f"[WeeklyReport] Notify failed: {exc}")
+
+
+def _auto_job_notify_enabled() -> bool:
+    raw = os.getenv("AUTO_JOB_NOTIFY_TELEGRAM", "true").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+async def _notify_auto_job(context: CallbackContext, title: str, details: List[str]) -> None:
+    """Send auto-job summary to authorized chat if enabled."""
+    if not _auto_job_notify_enabled():
+        return
+    try:
+        app = context.application
+        state_path: Path = app.bot_data["state_path"]
+        state = _load_state(state_path)
+        chat_id = state.get("authorized_chat_id")
+        if chat_id is None:
+            return
+        text = f"🤖 {title}\n" + "\n".join(f"- {x}" for x in details)
+        await context.bot.send_message(chat_id=int(chat_id), text=text)
+    except Exception as exc:
+        logging.warning(f"[AutoJob] notify failed: {exc}")
+
+
+async def detect_new_clip_job(context: CallbackContext) -> None:
+    """Every 6h: crawl @loki_tran, detect new videos, auto-write to LỊCH ĐĂNG.
+
+    Activates automatically when RAPIDAPI_KEY is set.
+    No manual commands needed from Kenny.
+    """
+    logging.info("[TikTok] detect_new_clip_job started")
     provider = TikTokMetricsProvider()
     if not provider.available():
-        logging.info("[TikTok] detect_new_clip_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
+        logging.info("[TikTok] detect_new_clip_job: RAPIDAPI_KEY not set — skip")
+        await _notify_auto_job(
+            context,
+            "Detect clip mới (6h)",
+            ["Trạng thái: skip", "Lý do: chưa có RAPIDAPI_KEY"],
+        )
         return
+
+    sh = _sheet_open()
+    if sh is None:
+        logging.warning("[TikTok] detect_new_clip_job: cannot open Google Sheet")
+        await _notify_auto_job(
+            context,
+            "Detect clip mới (6h)",
+            ["Trạng thái: lỗi", "Lý do: không mở được Google Sheet"],
+        )
+        return
+
+    # Read channel handle from Thông tin tab
+    handle = _read_tiktok_loki_handle(sh)
+    if not handle:
+        logging.warning("[TikTok] detect_new_clip_job: no active TikTok VN channel in Thông tin tab")
+        await _notify_auto_job(
+            context,
+            "Detect clip mới (6h)",
+            ["Trạng thái: lỗi", "Lý do: không tìm thấy TikTok VN active trong tab Thông tin"],
+        )
+        return
+
+    # Index of links already recorded in LỊCH ĐĂNG
+    existing_links = _sheet_read_schedule_links(sh)
+
+    # Fetch videos posted in last 6h
+    recent_videos = provider.detect_recent_posts(handle, hours_back=6)
+    if not recent_videos:
+        logging.info(f"[TikTok] detect_new_clip_job: no new videos in last 6h for @{handle}")
+        await _notify_auto_job(
+            context,
+            "Detect clip mới (6h)",
+            [f"Kênh: @{handle}", "Video mới trong 6h: 0", "Đã ghi vào LỊCH ĐĂNG: 0"],
+        )
+        return
+
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+
+    new_clips: List[str] = []
+    duplicate_count = 0
+    failed_count = 0
+    slot_exhausted = False
+    # Sort oldest-first so clip IDs are assigned in chronological order
+    for video in sorted(recent_videos, key=lambda v: v["posted_at"] or datetime.min):
+        if video["link"] in existing_links:
+            logging.info(f"[TikTok] Already in sheet, skip: {video['link']}")
+            duplicate_count += 1
+            continue
+
+        # Find next pre-numbered empty row in LỊCH ĐĂNG
+        clip_id = _next_available_schedule_id(sh)
+        if clip_id is None:
+            logging.warning("[TikTok] detect_new_clip_job: no empty slot in LỊCH ĐĂNG, stop")
+            slot_exhausted = True
+            break
+
+        posted_at = video["posted_at"] or datetime.now()
+        ok = _sheet_write_clip(
+            clip_id=clip_id,
+            clip_day=posted_at.date(),
+            posted_at=posted_at,
+            title=video["title"],
+            link=video["link"],
+        )
+        if not ok:
+            logging.warning(f"[TikTok] detect_new_clip_job: failed to write clip #{clip_id}")
+            failed_count += 1
+            continue
+
+        # Update state
+        state.setdefault("clips", {})[str(clip_id)] = {
+            "id": clip_id,
+            "title": video["title"],
+            "date": posted_at.strftime("%Y-%m-%d"),
+            "views": video["views"],
+            "likes": video["likes"],
+            "comments": video["comments"],
+            "shares": video["shares"],
+            "link": video["link"],
+        }
+        if clip_id >= state.get("next_id", 1):
+            state["next_id"] = clip_id + 1
+        _save_state(state_path, state)
+
+        new_clips.append(f"#{clip_id} — {video['title'][:40] or video['link']}")
+        logging.info(f"[TikTok] Auto-detected new clip #{clip_id}: {video['title'][:60]}")
+
+    # Notify Kenny on Telegram
+    if new_clips:
+        chat_id = state.get("authorized_chat_id")
+        if chat_id:
+            lines = "\n".join(f"• {c}" for c in new_clips)
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    f"🆕 Phát hiện {len(new_clips)} clip mới từ @{handle}!\n"
+                    f"Đã ghi vào LỊCH ĐĂNG tự động:\n{lines}"
+                ),
+            )
+
+    summary_lines = [
+        f"Kênh: @{handle}",
+        f"Video API trả về (6h): {len(recent_videos)}",
+        f"Đã có sẵn trong sheet: {duplicate_count}",
+        f"Ghi mới thành công: {len(new_clips)}",
+        f"Ghi lỗi: {failed_count}",
+    ]
+    if slot_exhausted:
+        summary_lines.append("Cảnh báo: hết slot trống trong LỊCH ĐĂNG")
+    await _notify_auto_job(context, "Detect clip mới (6h)", summary_lines)
 
 
 async def refresh_tiktok_stats_job(context: CallbackContext) -> None:
-    """Every 12h: refresh stats for known clip links (placeholder until API key)."""
-    if not _paid_phase2_enabled():
-        logging.info("[TikTok] refresh_tiktok_stats_job skipped: free-first mode is ON")
-        return
+    """Every 12h: fetch current stats for all clips with TikTok links in LỊCH ĐĂNG.
+
+    Activates automatically when RAPIDAPI_KEY is set.
+    Updates views/likes/comments/shares + refreshes Dashboard & KPI.
+    """
+    logging.info("[TikTok] refresh_tiktok_stats_job started")
     provider = TikTokMetricsProvider()
     if not provider.available():
-        logging.info("[TikTok] refresh_tiktok_stats_job skipped: missing RAPIDAPI_KEY/TIKAPI_KEY")
+        logging.info("[TikTok] refresh_tiktok_stats_job: RAPIDAPI_KEY not set — skip")
+        await _notify_auto_job(
+            context,
+            "Refresh stats (12h)",
+            ["Trạng thái: skip", "Lý do: chưa có RAPIDAPI_KEY"],
+        )
         return
+
+    sh = _sheet_open()
+    if sh is None:
+        logging.warning("[TikTok] refresh_tiktok_stats_job: cannot open Google Sheet")
+        await _notify_auto_job(
+            context,
+            "Refresh stats (12h)",
+            ["Trạng thái: lỗi", "Lý do: không mở được Google Sheet"],
+        )
+        return
+
+    link_to_id = _sheet_read_schedule_links(sh)
+    if not link_to_id:
+        logging.info("[TikTok] refresh_tiktok_stats_job: no TikTok links found in LỊCH ĐĂNG")
+        await _notify_auto_job(
+            context,
+            "Refresh stats (12h)",
+            ["Link TikTok trong LỊCH ĐĂNG: 0", "Clip update thành công: 0"],
+        )
+        return
+
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+
+    updated = 0
+    no_data = 0
+    write_failed = 0
+    for link, clip_id in link_to_id.items():
+        metrics = provider.fetch_post_metrics(link)
+        if metrics is None:
+            logging.warning(f"[TikTok] refresh_stats: no data for clip #{clip_id} ({link})")
+            no_data += 1
+            continue
+        ok = _sheet_auto_update_stats(
+            sh, clip_id,
+            metrics["views"], metrics["likes"],
+            metrics["comments"], metrics["shares"],
+        )
+        if ok:
+            updated += 1
+            # Update state too
+            clip_state = state.get("clips", {}).get(str(clip_id), {})
+            clip_state.update({"views": metrics["views"], "likes": metrics["likes"],
+                               "comments": metrics["comments"], "shares": metrics["shares"]})
+            state.setdefault("clips", {})[str(clip_id)] = clip_state
+        else:
+            write_failed += 1
+
+    if updated:
+        _save_state(state_path, state)
+        _sheet_refresh_dashboard_loki(sh)
+        _sheet_apply_kpi_month_formulas(sh)
+        logging.info(f"[TikTok] refresh_tiktok_stats_job: updated {updated}/{len(link_to_id)} clips")
+
+    await _notify_auto_job(
+        context,
+        "Refresh stats (12h)",
+        [
+            f"Link TikTok cần update: {len(link_to_id)}",
+            f"Update thành công: {updated}",
+            f"Không lấy được data API: {no_data}",
+            f"Ghi sheet lỗi: {write_failed}",
+        ],
+    )
+
+
+async def cmd_report_now(update: Update, context: CallbackContext) -> None:
+    """Fill BÁO CÁO TUẦN cho tuần đang chạy (T2 → hôm nay)."""
+    if update.effective_chat is None:
+        return
+    state = _load_state(context.bot_data["state_path"])
+    if not _is_authorized(state, update.effective_chat.id):
+        await update.message.reply_text(_reject_text())
+        return
+
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    week_end = today
+
+    sh = _sheet_open()
+    if sh is None:
+        await update.message.reply_text("⚠️ Không mở được sheet.")
+        return
+
+    ok = _sheet_fill_weekly_report(sh, week_start, week_end)
+    if ok:
+        await update.message.reply_text(
+            f"✅ BÁO CÁO TUẦN đã cập nhật\n"
+            f"Tuần: {week_start.strftime('%d/%m/%Y')} → {week_end.strftime('%d/%m/%Y')} (đến hôm nay)\n"
+            f"Mở sheet để xem kết quả."
+        )
+    else:
+        await update.message.reply_text("⚠️ Ghi BÁO CÁO TUẦN thất bại.")
 
 
 async def morning_kpi_warning_job(context: CallbackContext) -> None:
@@ -2004,7 +3060,7 @@ async def morning_status_job(context: CallbackContext) -> None:
     if chat_id is None:
         return
 
-    text = _progress_text(state)
+    text = f"{_today_report_text(state)}\n\n{_progress_text(state)}"
     await context.bot.send_message(chat_id=int(chat_id), text=text)
 
 
@@ -2035,8 +3091,49 @@ async def evening_kpi_job(context: CallbackContext) -> None:
     if chat_id is None:
         return
 
-    text = build_evening_kpi_text(_progress_text(state))
+    recap = f"{_today_report_text(state)}\n\n{_kpi_warning_text(state)}\n\n{_progress_text(state)}"
+    text = build_evening_kpi_text(recap)
     await context.bot.send_message(chat_id=int(chat_id), text=text)
+
+
+async def no_clip_24h_alert_job(context: CallbackContext) -> None:
+    """Alert if there is no new clip for at least 24 hours."""
+    app = context.application
+    state_path: Path = app.bot_data["state_path"]
+    state = _load_state(state_path)
+    chat_id = state.get("authorized_chat_id")
+    if chat_id is None:
+        return
+
+    latest = _latest_clip_datetime(state)
+    if latest is None:
+        return
+
+    now_dt = datetime.now()
+    hours_since = (now_dt - latest).total_seconds() / 3600
+    if hours_since < 24:
+        return
+
+    cooldown_hours = max(1, int(os.getenv("TG_NO_CLIP_ALERT_COOLDOWN_HOURS", "12")))
+    last_alert_raw = str(state.get("last_no_clip_alert_at", "") or "").strip()
+    if last_alert_raw:
+        try:
+            last_alert = datetime.fromisoformat(last_alert_raw)
+            if (now_dt - last_alert).total_seconds() < cooldown_hours * 3600:
+                return
+        except ValueError:
+            pass
+
+    text = (
+        "CANH BAO 24H KHONG CO CLIP MOI\n"
+        f"- Clip gan nhat: {latest.strftime('%d/%m/%Y %H:%M')}\n"
+        f"- Da qua: {int(hours_since)} gio\n"
+        "- De xuat: dang toi thieu 1 clip trong hom nay de giu nhip KPI.\n\n"
+        f"{_progress_text(state)}"
+    )
+    await context.bot.send_message(chat_id=int(chat_id), text=text)
+    state["last_no_clip_alert_at"] = now_dt.isoformat(timespec="seconds")
+    _save_state(state_path, state)
 
 
 def _parse_reminder_times() -> List[tuple[int, int]]:
@@ -2118,18 +3215,35 @@ def _register_jobs(app: Application) -> None:
         days=(5,),  # Saturday
     )
 
+    # Daily: sync only BÁO CÁO TUẦN (no updates to other tabs)
+    weekly_sync_hour = int(os.getenv("TG_WEEKLY_SYNC_HOUR", "18"))
+    weekly_sync_minute = int(os.getenv("TG_WEEKLY_SYNC_MINUTE", "10"))
+    jq.run_daily(
+        weekly_report_sync_only_job,
+        time=datetime.strptime(f"{weekly_sync_hour:02d}:{weekly_sync_minute:02d}", "%H:%M").time(),
+    )
+
     # Every 6h: detect new clips (provider placeholder)
     jq.run_repeating(
         detect_new_clip_job,
         interval=timedelta(hours=6),
-        first=timedelta(minutes=3),
+        first=timedelta(seconds=30),
     )
 
-    # Every 12h: refresh stats for known clips (provider placeholder)
+    # Refresh stats interval can be tuned by env (default 12h = 2 times/day)
+    refresh_hours = max(1, int(os.getenv("TG_TIKTOK_REFRESH_HOURS", "12")))
     jq.run_repeating(
         refresh_tiktok_stats_job,
-        interval=timedelta(hours=12),
-        first=timedelta(minutes=7),
+        interval=timedelta(hours=refresh_hours),
+        first=timedelta(seconds=90),
+    )
+
+    # Every N hours: alert if no new clip in 24h (anti-spam via cooldown)
+    no_clip_check_hours = max(1, int(os.getenv("TG_NO_CLIP_ALERT_CHECK_HOURS", "2")))
+    jq.run_repeating(
+        no_clip_24h_alert_job,
+        interval=timedelta(hours=no_clip_check_hours),
+        first=timedelta(minutes=15),
     )
 
 
@@ -2141,6 +3255,7 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("add_clip", cmd_add_clip))
+    app.add_handler(CommandHandler("log_clip", cmd_log_clip))
     app.add_handler(CommandHandler("set_views", cmd_set_views))
     app.add_handler(CommandHandler("remove_clip", cmd_remove_clip))
     app.add_handler(CommandHandler("list_clips", cmd_list_clips))
@@ -2159,6 +3274,7 @@ def build_application(token: str, workspace_root: Path) -> Application:
     app.add_handler(CommandHandler("free_status", cmd_free_status))
     app.add_handler(CommandHandler("free_refresh", cmd_free_refresh))
     app.add_handler(CommandHandler("phase2_status", cmd_phase2_status))
+    app.add_handler(CommandHandler("report_now", cmd_report_now))
     app.add_handler(CommandHandler("phase2_scan_now", cmd_phase2_scan_now))
 
     _register_jobs(app)
