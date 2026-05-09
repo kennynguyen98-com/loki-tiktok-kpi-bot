@@ -982,6 +982,39 @@ def _sheet_apply_total_report_formulas_from_weekly(sh) -> bool:
             {"range": "N20", "values": [["=IF(L20>=M20;\"✅\";\"❌\")"]]},
             {"range": "N21", "values": [["=IF(L21>=IFERROR(VALUE(SUBSTITUTE(M21;\"k\";\"000\"));0);\"✅\";\"❌\")"]]},
             {"range": "L23", "values": [["=COUNTIF(L12:N12;\"✅ Đạt\")"]]},
+
+            # Year summary (Section C)
+            {"range": "D28", "values": [["=C20"]]},
+            {"range": "E28", "values": [["=F20"]]},
+            {"range": "F28", "values": [["=I20"]]},
+            {"range": "G28", "values": [["=L20"]]},
+            {"range": "H28", "values": [["=SUM(D28:G28)"]]},
+            {"range": "I28", "values": [["=IFERROR((G28-D28)/D28;0)"]]},
+            {"range": "J28", "values": [["=IF(H28>=IFERROR(VALUE(REGEXEXTRACT(C28;\"[0-9]+\"));0);\"✅\";\"❌\")"]]},
+
+            {"range": "D29", "values": [["=C21"]]},
+            {"range": "E29", "values": [["=F21"]]},
+            {"range": "F29", "values": [["=I21"]]},
+            {"range": "G29", "values": [["=L21"]]},
+            {"range": "H29", "values": [["=SUM(D29:G29)"]]},
+            {"range": "I29", "values": [["=IFERROR((G29-D29)/D29;0)"]]},
+            {"range": "J29", "values": [["=IF(H29>=IFERROR(VALUE(SUBSTITUTE(SUBSTITUTE(C29;\".\";\"\");\"+\";\"\"));0);\"✅\";\"❌\")"]]},
+
+            {"range": "D30", "values": [["=IFERROR(SUM(C11:E11);0)"]]},
+            {"range": "E30", "values": [["=IFERROR(SUM(F11:H11);0)"]]},
+            {"range": "F30", "values": [["=IFERROR(SUM(I11:K11);0)"]]},
+            {"range": "G30", "values": [["=IFERROR(SUM(L11:N11);0)"]]},
+            {"range": "H30", "values": [["=SUM(D30:G30)"]]},
+            {"range": "I30", "values": [["=IFERROR((G30-D30)/D30;0)"]]},
+
+            {"range": "D31", "values": [["=IFERROR(SUM(C13:E13);0)"]]},
+            {"range": "E31", "values": [["=IFERROR(SUM(F13:H13);0)"]]},
+            {"range": "F31", "values": [["=IFERROR(SUM(I13:K13);0)"]]},
+            {"range": "G31", "values": [["=IFERROR(SUM(L13:N13);0)"]]},
+            {"range": "H31", "values": [["=SUM(D31:G31)"]]},
+            {"range": "I31", "values": [["=IFERROR((G31-D31)/D31;0)"]]},
+
+            {"range": "H32", "values": [["=COUNTIF(C12:N12;\"✅ Đạt\")&\"/12\""]]},
         ])
 
         ws.batch_update(updates, value_input_option="USER_ENTERED")
