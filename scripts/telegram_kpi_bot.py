@@ -849,9 +849,145 @@ def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
             ])
 
         ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+        # Persist weekly aggregates to a data table inside BÁO CÁO TUẦN,
+        # then let BÁO CÁO TỔNG pull monthly values from this table.
+        _sheet_upsert_weekly_report_history(
+            sh,
+            week_start=week_start,
+            week_end=week_end,
+            clips=clips,
+            total_views=total_views,
+            ge10k=ge10k,
+            ge5k=ge5k,
+            approved_posted_scripts=approved_posted_scripts,
+        )
+        _sheet_apply_total_report_formulas_from_weekly(sh)
         return True
     except Exception as exc:
         logging.warning(f"[Sheet] _sheet_fill_weekly_report error: {exc}")
+        return False
+
+
+def _sheet_upsert_weekly_report_history(
+    sh,
+    week_start: date,
+    week_end: date,
+    clips: int,
+    total_views: int,
+    ge10k: int,
+    ge5k: int,
+    approved_posted_scripts: int,
+) -> bool:
+    """Store one row/week history in BÁO CÁO TUẦN (hidden data area J:R)."""
+    try:
+        ws = _ws_like(sh, "BÁO CÁO TUẦN")
+        if ws is None:
+            return False
+
+        # Hidden data table area:
+        # J: week_start, K: week_end, L: year, M: month, N: clips,
+        # O: views, P: ge10k, Q: ge5k, R: approved_posted_scripts
+        ws.update(
+            range_name="J2:R2",
+            values=[["week_start", "week_end", "year", "month", "clips", "views", "ge10k", "ge5k", "approved_scripts"]],
+            value_input_option="USER_ENTERED",
+        )
+
+        existing = ws.get("J3:R") or []
+        target_row = None
+        for idx, row in enumerate(existing, start=3):
+            if not row:
+                continue
+            cell = row[0] if len(row) > 0 else ""
+            d = _parse_sheet_date(cell)
+            if d == week_start:
+                target_row = idx
+                break
+
+        if target_row is None:
+            target_row = 3 + len(existing)
+
+        ws.update(
+            range_name=f"J{target_row}:R{target_row}",
+            values=[[
+                week_start.strftime("%d/%m/%Y"),
+                week_end.strftime("%d/%m/%Y"),
+                week_start.year,
+                week_start.month,
+                clips,
+                total_views,
+                ge10k,
+                ge5k,
+                approved_posted_scripts,
+            ]],
+            value_input_option="USER_ENTERED",
+        )
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_upsert_weekly_report_history error: {exc}")
+        return False
+
+
+def _sheet_apply_total_report_formulas_from_weekly(sh) -> bool:
+    """Fill BÁO CÁO TỔNG monthly cells (T1..T12) sourced from BÁO CÁO TUẦN history."""
+    try:
+        ws = _ws_like(sh, "BÁO CÁO TỔNG")
+        if ws is None:
+            return False
+
+        year_expr = "YEAR(TODAY())"
+        updates = []
+
+        for m in range(1, 13):
+            col = m + 2  # C..N
+            a6 = gspread.utils.rowcol_to_a1(6, col)
+            a7 = gspread.utils.rowcol_to_a1(7, col)
+            a8 = gspread.utils.rowcol_to_a1(8, col)
+            a9 = gspread.utils.rowcol_to_a1(9, col)
+            a10 = gspread.utils.rowcol_to_a1(10, col)
+            a12 = gspread.utils.rowcol_to_a1(12, col)
+
+            updates.extend([
+                {"range": a6, "values": [[f"=IFERROR(SUMIFS('BÁO CÁO TUẦN'!$N:$N;'BÁO CÁO TUẦN'!$L:$L;{year_expr};'BÁO CÁO TUẦN'!$M:$M;{m});0)"]]},
+                {"range": a7, "values": [[f"=IFERROR(SUMIFS('BÁO CÁO TUẦN'!$O:$O;'BÁO CÁO TUẦN'!$L:$L;{year_expr};'BÁO CÁO TUẦN'!$M:$M;{m});0)"]]},
+                {"range": a8, "values": [[f"=IFERROR(SUMIFS('BÁO CÁO TUẦN'!$P:$P;'BÁO CÁO TUẦN'!$L:$L;{year_expr};'BÁO CÁO TUẦN'!$M:$M;{m});0)"]]},
+                {"range": a9, "values": [[f"=IFERROR(SUMIFS('BÁO CÁO TUẦN'!$Q:$Q;'BÁO CÁO TUẦN'!$L:$L;{year_expr};'BÁO CÁO TUẦN'!$M:$M;{m});0)"]]},
+                {"range": a10, "values": [[f"=IFERROR({a7}/{a6};0)"]]},
+                {"range": a12, "values": [[f"=IF(AND({a6}>=20;{a7}>=30000;{a8}>=1;{a9}>=1);\"✅ Đạt\";\"❌ Chưa đạt\")"]]},
+            ])
+
+        # Quarter rollups from monthly table
+        updates.extend([
+            {"range": "C20", "values": [["=SUM(C6:E6)"]]},
+            {"range": "C21", "values": [["=SUM(C7:E7)"]]},
+            {"range": "E20", "values": [["=IF(C20>=D20;\"✅\";\"❌\")"]]},
+            {"range": "E21", "values": [["=IF(C21>=IFERROR(VALUE(SUBSTITUTE(D21;\"k\";\"000\"));0);\"✅\";\"❌\")"]]},
+            {"range": "C23", "values": [["=COUNTIF(C12:E12;\"✅ Đạt\")"]]},
+
+            {"range": "F20", "values": [["=SUM(F6:H6)"]]},
+            {"range": "F21", "values": [["=SUM(F7:H7)"]]},
+            {"range": "H20", "values": [["=IF(F20>=G20;\"✅\";\"❌\")"]]},
+            {"range": "H21", "values": [["=IF(F21>=IFERROR(VALUE(SUBSTITUTE(G21;\"k\";\"000\"));0);\"✅\";\"❌\")"]]},
+            {"range": "F23", "values": [["=COUNTIF(F12:H12;\"✅ Đạt\")"]]},
+
+            {"range": "I20", "values": [["=SUM(I6:K6)"]]},
+            {"range": "I21", "values": [["=SUM(I7:K7)"]]},
+            {"range": "K20", "values": [["=IF(I20>=J20;\"✅\";\"❌\")"]]},
+            {"range": "K21", "values": [["=IF(I21>=IFERROR(VALUE(SUBSTITUTE(J21;\"k\";\"000\"));0);\"✅\";\"❌\")"]]},
+            {"range": "I23", "values": [["=COUNTIF(I12:K12;\"✅ Đạt\")"]]},
+
+            {"range": "L20", "values": [["=SUM(L6:N6)"]]},
+            {"range": "L21", "values": [["=SUM(L7:N7)"]]},
+            {"range": "N20", "values": [["=IF(L20>=M20;\"✅\";\"❌\")"]]},
+            {"range": "N21", "values": [["=IF(L21>=IFERROR(VALUE(SUBSTITUTE(M21;\"k\";\"000\"));0);\"✅\";\"❌\")"]]},
+            {"range": "L23", "values": [["=COUNTIF(L12:N12;\"✅ Đạt\")"]]},
+        ])
+
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        return True
+    except Exception as exc:
+        logging.warning(f"[Sheet] _sheet_apply_total_report_formulas_from_weekly error: {exc}")
         return False
 
 
