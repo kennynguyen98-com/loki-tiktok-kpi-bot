@@ -776,29 +776,33 @@ def _sheet_fill_weekly_report(sh, week_start: date, week_end: date) -> bool:
         ]
 
         # KPI section rows 8..12
-        target = {
-            8: 5,
-            9: 7500,
-            10: 1,
-            11: 1,
-            12: 3,  # script hoàn thành (placeholder)
-        }
-        actual = {
-            8: clips,
-            9: total_views,
-            10: ge10k,
-            11: ge5k,
-            12: approved_posted_scripts,
-        }
-
+        # Keep these rows formula-driven so editing E4/G4 (from/to date) updates KPI instantly.
+        date_expr = (
+            "IFERROR(IF(ISNUMBER('LỊCH ĐĂNG'!$H:$H);'LỊCH ĐĂNG'!$H:$H;"
+            "DATE(VALUE(RIGHT('LỊCH ĐĂNG'!$H:$H;4));VALUE(MID('LỊCH ĐĂNG'!$H:$H;4;2));VALUE(LEFT('LỊCH ĐĂNG'!$H:$H;2))));0)"
+        )
+        updates.extend([
+            {
+                "range": "D8",
+                "values": [[f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>=$E$4)*({date_expr}<=$G$4))"]],
+            },
+            {
+                "range": "D9",
+                "values": [[f"=SUMPRODUCT((IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0))*({date_expr}>=$E$4)*({date_expr}<=$G$4))"]],
+            },
+            {
+                "range": "D10",
+                "values": [[f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>=$E$4)*({date_expr}<=$G$4)*(IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0)>=10000))"]],
+            },
+            {
+                "range": "D11",
+                "values": [[f"=SUMPRODUCT(('LỊCH ĐĂNG'!$B:$B<>\"\")*({date_expr}>=$E$4)*({date_expr}<=$G$4)*(IFERROR(VALUE('LỊCH ĐĂNG'!$K:$K);0)>=5000))"]],
+            },
+            {"range": "D12", "values": [[approved_posted_scripts]]},
+        ])
         for r in [8, 9, 10, 11, 12]:
-            a = actual[r]
-            t = target[r]
-            diff = a - t
-            ok = "✅" if a >= t else "⚠️"
-            updates.append({"range": f"D{r}", "values": [[a]]})
-            updates.append({"range": f"E{r}", "values": [[ok]]})
-            updates.append({"range": f"F{r}", "values": [[diff]]})
+            updates.append({"range": f"E{r}", "values": [[f"=IF(D{r}>=C{r};\"✅\";\"⚠️\")"]]})
+            updates.append({"range": f"F{r}", "values": [[f"=D{r}-C{r}"]]})
 
         # Top 3 rows 16..18
         top = sorted(week_rows, key=lambda row: _to_int_safe(row[c_views] if c_views < len(row) else ""), reverse=True)[:3]
