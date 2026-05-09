@@ -2198,11 +2198,20 @@ async def cmd_brief(update: Update, context: CallbackContext) -> None:
 
 
 def _phase2_status_text() -> str:
-    provider = TikTokMetricsProvider()
+    logging.info("[DEBUG] _phase2_status_text() started")
+    try:
+        logging.info("[DEBUG] Creating TikTokMetricsProvider...")
+        provider = TikTokMetricsProvider()
+        logging.info(f"[DEBUG] Provider created: has rapidapi_key={bool(provider.rapidapi_key)}")
+    except Exception as e:
+        logging.error(f"[ERROR] Failed to create TikTokMetricsProvider: {e}", exc_info=True)
+        return f"❌ Lỗi: {e}"
+    
     rapid = "✅" if provider.rapidapi_key else "❌"
     paid_enabled = _paid_phase2_enabled()
     paid_ready = paid_enabled and provider.available()
     refresh_hours = max(1, int(os.getenv("TG_TIKTOK_REFRESH_HOURS", "12")))
+    logging.info(f"[DEBUG] Status: paid_enabled={paid_enabled}, paid_ready={paid_ready}")
     return (
         "🧩 PHASE 2 STATUS\n"
         f"- Free-first mode: {'✅ Bật' if not paid_enabled else '⚠️ Tắt'}\n"
@@ -2268,13 +2277,26 @@ async def cmd_free_refresh(update: Update, context: CallbackContext) -> None:
 
 
 async def cmd_phase2_status(update: Update, context: CallbackContext) -> None:
+    logging.info(f"[DEBUG] cmd_phase2_status called from chat_id={update.effective_chat.id if update.effective_chat else 'None'}")
     if update.effective_chat is None or context.bot_data.get("state_path") is None:
+        logging.warning("[DEBUG] Missing effective_chat or state_path")
         return
+    logging.info("[DEBUG] Loading state...")
     state = _load_state(context.bot_data["state_path"])
+    logging.info(f"[DEBUG] State loaded, checking authorization for chat_id={update.effective_chat.id}")
     if not _is_authorized(state, update.effective_chat.id):
+        logging.warning(f"[DEBUG] Chat {update.effective_chat.id} not authorized")
         await update.message.reply_text(_reject_text())
         return
-    await update.message.reply_text(_phase2_status_text())
+    logging.info("[DEBUG] Authorized, generating status text...")
+    try:
+        status_text = _phase2_status_text()
+        logging.info(f"[DEBUG] Status text generated ({len(status_text)} chars)")
+        await update.message.reply_text(status_text)
+        logging.info("[DEBUG] Status reply sent successfully")
+    except Exception as e:
+        logging.error(f"[ERROR] Failed in cmd_phase2_status: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Lỗi: {e}")
 
 
 async def cmd_phase2_scan_now(update: Update, context: CallbackContext) -> None:
